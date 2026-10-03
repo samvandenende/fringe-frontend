@@ -1,0 +1,396 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Fringe Simulation Environment</title>
+  <link rel="icon" href="logo.png">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <img src="logo.png" alt="" width="26" height="26">
+      <span class="name">fringe</span>
+      <span class="sub">simulation environment</span>
+    </div>
+    <nav class="repo-links" aria-label="Source code">
+      <a href="https://github.com/samvandenende/fringe" target="_blank" rel="noopener" title="fringe simulator on GitHub" aria-label="fringe on GitHub"><svg width="14" height="14" viewBox="0 0 16 16" aria-hidden="true"><path fill="currentColor" d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg><span>fringe</span></a>
+      <a href="https://github.com/samvandenende/fringe-frontend" target="_blank" rel="noopener" title="This frontend on GitHub" aria-label="fringe-frontend on GitHub"><svg width="14" height="14" viewBox="0 0 16 16" aria-hidden="true"><path fill="currentColor" d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg><span>fringe-frontend</span></a>
+    </nav>
+    <div class="run-state" id="run-state" data-state="idle">
+      <span class="dot"></span>
+      <span id="status-text">Idle</span>
+      <div class="progress"><div class="bar" id="progress-bar"></div></div>
+    </div>
+    <div class="top-actions">
+      <button class="icon-btn" id="theme-toggle" title="Toggle light/dark theme" aria-label="Toggle theme"><svg width="15" height="15" viewBox="0 0 16 16" aria-hidden="true"><circle cx="8" cy="8" r="6.25" fill="none" stroke="currentColor" stroke-width="1.5"/><path d="M8 1.75a6.25 6.25 0 0 1 0 12.5z" fill="currentColor"/></svg></button>
+      <button class="btn" id="cancel-btn" hidden>Cancel</button>
+      <button class="btn primary" id="run-btn">▶ Run simulation</button>
+    </div>
+  </header>
+
+  <div class="layout">
+    <aside class="sidebar" id="sidebar">
+      <!-- Simulation -->
+      <details class="group" open>
+        <summary>Simulation</summary>
+        <div class="field">
+          <label>Runtime</label>
+          <div class="segmented" id="runtime">
+            <button data-value="gpu" class="on">GPU</button>
+            <button data-value="cpu">CPU</button>
+          </div>
+        </div>
+        <div class="row2">
+          <div class="field">
+            <label for="freq-res" title="FFT oversampling factor for spectrum synthesis">Frequency resolution</label>
+            <select id="freq-res"><option>1</option><option>2</option><option selected>4</option><option>8</option><option>16</option></select>
+          </div>
+          <div class="field">
+            <label for="integrations" title="Number of consecutive sample windows">Integrations</label>
+            <input id="integrations" type="number" min="1" max="100000" value="20">
+          </div>
+        </div>
+        <div class="field">
+          <label for="seed">RNG seed <span class="hint">blank = random</span></label>
+          <input id="seed" type="number" min="0" step="1" value="42" placeholder="random">
+        </div>
+        <p class="note" id="workload-note"></p>
+      </details>
+
+      <!-- Array -->
+      <details class="group" open>
+        <summary>Array <span class="badge" id="array-badge"></span></summary>
+        <div class="btn-row">
+          <button class="btn small" id="array-default" title="32 × 32 grid, 4 m spacing, 120 MHz sampling, 15–45 MHz band">Default</button>
+          <label class="btn small file">Load JSON<input type="file" id="array-file" accept=".json,application/json" hidden></label>
+          <button class="btn small" id="array-export">Export</button>
+          <button class="btn small" id="array-python" title="Write a Python function that creates the layout">Python…</button>
+        </div>
+        <details class="sub">
+          <summary>Generate layout</summary>
+          <div class="field">
+            <select id="gen-layout">
+              <option value="grid">Regular grid</option>
+              <option value="random">Random disk</option>
+              <option value="ring">Ring</option>
+            </select>
+          </div>
+          <div class="row3" id="gen-params"></div>
+          <button class="btn small" id="gen-array">Generate</button>
+        </details>
+        <div class="row2">
+          <div class="field"><label for="fs">Sample freq. <span class="unit">MHz</span></label><input id="fs" type="number" step="any" min="0"></div>
+          <div class="field"><label for="fdown">Downmix <span class="unit">MHz</span></label><input id="fdown" type="number" step="any" min="0"></div>
+        </div>
+        <div class="row2">
+          <div class="field"><label for="bp-min">Bandpass min <span class="unit">MHz</span></label><input id="bp-min" type="number" step="any" min="0"></div>
+          <div class="field"><label for="bp-max">Bandpass max <span class="unit">MHz</span></label><input id="bp-max" type="number" step="any" min="0"></div>
+        </div>
+        <div class="row2">
+          <div class="field">
+            <label for="window-size">Window size</label>
+            <select id="window-size"></select>
+          </div>
+          <div class="field"><label for="noise" title="System noise intensity (fringe units)">System noise</label><input id="noise" type="number" step="any" min="0"></div>
+        </div>
+        <p class="error" id="array-error" hidden></p>
+      </details>
+
+      <!-- Sky model -->
+      <details class="group" open>
+        <summary>Sky model <span class="badge" id="sky-badge"></span></summary>
+        <div class="btn-row">
+          <button class="btn small" id="sky-default" title="Bundled GSM2016 sky on the lunar far side (web/data/default_sky.csv)">Default</button>
+          <label class="btn small file">Load CSV<input type="file" id="sky-file" accept=".csv,text/csv" hidden></label>
+          <button class="btn small" id="sky-export">Export</button>
+          <button class="btn small ghost" id="sky-clear">Clear</button>
+        </div>
+        <p class="note sky-origin" id="sky-origin"></p>
+        <details class="sub">
+          <summary>Generate random sky</summary>
+          <div class="row3">
+            <div class="field"><label for="sky-n">Sources</label><input id="sky-n" type="number" value="500" min="1"></div>
+            <div class="field"><label for="sky-seed">Seed</label><input id="sky-seed" type="number" value="1"></div>
+            <div class="field"><label for="sky-alpha">Index α</label><input id="sky-alpha" type="number" value="-0.7" step="0.1"></div>
+          </div>
+          <div class="btn-row">
+            <button class="btn small" id="sky-generate">Replace</button>
+            <button class="btn small ghost" id="sky-append">Append</button>
+          </div>
+        </details>
+        <details class="sub" id="gsm-section">
+          <summary>Generate from GSM2016 (PyGDSM)</summary>
+          <p class="note warn" id="gsm-unavailable" hidden></p>
+          <div class="row2">
+            <div class="field">
+              <label for="gsm-nside" title="HEALPix NSIDE: one source per pixel">NSIDE</label>
+              <select id="gsm-nside">
+                <option>1</option><option>2</option><option>4</option><option>8</option><option>16</option>
+                <option selected>32</option><option>64</option><option>128</option><option>256</option>
+              </select>
+            </div>
+            <div class="field">
+              <label for="gsm-maps" title="Number of GSM maps across the frequency range used to fit each pixel's spectral index">Fit maps</label>
+              <input id="gsm-maps" type="number" value="5" min="2" max="256" step="1">
+            </div>
+          </div>
+          <div class="row3">
+            <div class="field"><label for="gsm-fmin">Fit min <span class="unit">MHz</span></label><input id="gsm-fmin" type="number" step="any" min="10"></div>
+            <div class="field"><label for="gsm-fmax">Fit max <span class="unit">MHz</span></label><input id="gsm-fmax" type="number" step="any" min="10"></div>
+            <div class="field">
+              <label for="gsm-resolution" title="GSM2016 base maps: low = NSIDE 64 (5°), hi = NSIDE 1024 (48′)">Base maps</label>
+              <select id="gsm-resolution"><option value="auto">Auto</option><option value="low">Low (5°)</option><option value="hi">High (48′)</option></select>
+            </div>
+          </div>
+          <div class="row-frame">
+            <div class="field">
+              <label for="gsm-frame" title="Coordinates written as RA/Dec. fringe's zenith is Dec = +90°">Frame</label>
+              <select id="gsm-frame">
+                <option value="lunar-farside" selected>Lunar far side</option>
+                <option value="equatorial">ICRS (RA/Dec)</option>
+                <option value="galactic">Galactic (l, b)</option>
+              </select>
+            </div>
+            <div class="field">
+              <label for="gsm-epoch" title="UTC epoch for the lunar far-side frame">Epoch <span class="unit">UTC</span></label>
+              <input id="gsm-epoch" type="datetime-local" step="1" value="2026-01-01T00:00:00">
+            </div>
+          </div>
+          <label class="check"><input type="checkbox" id="gsm-horizon" checked> Only Dec &gt; 0 (above fringe's horizon)</label>
+          <p class="note" id="gsm-note"></p>
+          <div class="btn-row" style="margin-top: 8px">
+            <button class="btn small" id="gsm-replace">Replace</button>
+            <button class="btn small ghost" id="gsm-append">Append</button>
+          </div>
+        </details>
+        <details class="sub">
+          <summary>Add point source</summary>
+          <div class="row3">
+            <div class="field"><label for="src-ra">RA <span class="unit">°</span></label><input id="src-ra" type="number" value="0" step="any"></div>
+            <div class="field"><label for="src-dec">Dec <span class="unit">°</span></label><input id="src-dec" type="number" value="60" step="any"></div>
+            <div class="field"><label for="src-i">I₀</label><input id="src-i" type="number" value="100000" step="any" min="0"></div>
+          </div>
+          <div class="row3">
+            <div class="field"><label for="src-f0">f₀ <span class="unit">MHz</span></label><input id="src-f0" type="number" value="30" step="any" min="0"></div>
+            <div class="field"><label for="src-alpha">Index α</label><input id="src-alpha" type="number" value="-0.7" step="any"></div>
+            <div class="field"><label>&nbsp;</label><button class="btn small" id="src-add">Add</button></div>
+          </div>
+        </details>
+        <div class="source-list" id="source-list"></div>
+      </details>
+
+      <!-- Calibrator -->
+      <details class="group">
+        <summary>Calibrator <span class="badge" id="cal-badge"></span></summary>
+        <label class="check"><input type="checkbox" id="cal-enabled"> Include calibrator source</label>
+        <div class="row3">
+          <div class="field"><label for="cal-x">x <span class="unit">m</span></label><input id="cal-x" type="number" step="any"></div>
+          <div class="field"><label for="cal-y">y <span class="unit">m</span></label><input id="cal-y" type="number" step="any"></div>
+          <div class="field"><label for="cal-z">z <span class="unit">m</span></label><input id="cal-z" type="number" step="any"></div>
+        </div>
+        <div class="field"><label for="cal-i">Intensity</label><input id="cal-i" type="number" step="any" min="0"></div>
+        <div class="btn-row">
+          <button class="btn small ghost" data-cal-preset="drone">Drone 150 m</button>
+          <button class="btn small ghost" data-cal-preset="satellite">Satellite 550 km</button>
+        </div>
+        <div class="btn-row">
+          <label class="btn small file">Load JSON<input type="file" id="cal-file" accept=".json,application/json" hidden></label>
+          <button class="btn small" id="cal-export">Export</button>
+        </div>
+      </details>
+
+      <!-- Analysis -->
+      <details class="group">
+        <summary>Analysis</summary>
+        <div class="row2">
+          <div class="field">
+            <label for="window-fn">Window function</label>
+            <select id="window-fn"><option value="hann" selected>Hann</option><option value="blackman">Blackman</option><option value="none">None (rectangular)</option></select>
+          </div>
+          <div class="field">
+            <label for="channels" title="Channels across the bandpass kept for imaging">Imaging channels</label>
+            <input id="channels" type="number" min="1" max="1024" value="64">
+          </div>
+        </div>
+        <p class="note">Spectra are averaged over all integrations. Per-integration E-fields at the imaging channels are kept on the server so images can be formed at any of them after the run.</p>
+      </details>
+    </aside>
+
+    <main class="main">
+      <nav class="tabs" role="tablist">
+        <button role="tab" data-tab="environment" class="on">Environment</button>
+        <button role="tab" data-tab="signals">Signals <span class="tab-dot" id="signals-dot" hidden></span></button>
+        <button role="tab" data-tab="imaging">Imaging <span class="tab-dot" id="imaging-dot" hidden></span></button>
+      </nav>
+
+      <!-- Environment -->
+      <section class="tab-panel" id="tab-environment">
+        <div class="toolbar">
+          <div class="tool">
+            <label for="view-freq">View frequency</label>
+            <input type="range" id="view-freq" min="0" max="1" step="0.001">
+            <output id="view-freq-out"></output>
+          </div>
+          <div class="tool">
+            <label for="env-cmap">Colormap</label>
+            <select id="env-cmap"></select>
+          </div>
+          <div class="tool">
+            <label for="sky-scale">Intensity scale</label>
+            <select id="sky-scale"><option value="auto">Auto</option><option value="linear">Linear</option><option value="log">Log</option></select>
+          </div>
+          <label class="check tool"><input type="checkbox" id="apparent" checked> Apparent (× z² gain)</label>
+          <label class="check tool"><input type="checkbox" id="rotate"> Auto-rotate</label>
+        </div>
+        <div class="grid env-grid">
+          <article class="card span-2 tall">
+            <header><h3>Scene</h3><p>Array, sky sphere and calibrator in fringe's local frame (z = zenith)</p></header>
+            <div class="viz" id="scene"></div>
+          </article>
+          <article class="card tall">
+            <header><h3>Derived parameters</h3></header>
+            <div class="params" id="params"></div>
+          </article>
+          <article class="card">
+            <header><h3>Array layout</h3><p id="array-caption"></p></header>
+            <div class="viz square" id="array-view"></div>
+          </article>
+          <article class="card">
+            <header><h3>Sky model</h3><p id="sky-caption"></p></header>
+            <div class="viz square" id="sky-view"></div>
+          </article>
+          <article class="card">
+            <header><h3>Array beam</h3><p id="beam-caption">Zenith-steered power pattern</p></header>
+            <div class="viz square" id="beam-view"></div>
+          </article>
+          <article class="card span-3">
+            <header><h3>Spectral model</h3><p>Expected per-bin power by component, as fringe synthesises it</p></header>
+            <div class="viz wide" id="model-spectrum"></div>
+          </article>
+        </div>
+      </section>
+
+      <!-- Signals -->
+      <section class="tab-panel" id="tab-signals" hidden>
+        <div class="empty-state" id="signals-empty">
+          <h3>No simulation output yet</h3>
+          <p>Configure the environment and press <b>Run simulation</b>. Time-domain antenna samples, spectra and waterfalls appear here.</p>
+        </div>
+        <div id="signals-content" hidden>
+          <div class="stale" id="signals-stale" hidden>These results come from an earlier configuration. Run again to update them.</div>
+          <div class="tiles" id="run-tiles"></div>
+          <div class="toolbar">
+            <div class="tool">
+              <label for="antenna-index">Antenna</label>
+              <button class="icon-btn" id="antenna-prev" aria-label="Previous antenna">‹</button>
+              <input type="number" id="antenna-index" min="0" value="0">
+              <button class="icon-btn" id="antenna-next" aria-label="Next antenna">›</button>
+              <output id="antenna-pos"></output>
+            </div>
+          </div>
+          <div class="grid sig-grid">
+            <article class="card">
+              <header><h3>In-band power per antenna</h3><p>Click an antenna to inspect it</p></header>
+              <div class="viz square" id="power-map"></div>
+            </article>
+            <article class="card span-2">
+              <header><h3>Time-domain samples</h3><p id="ts-caption">Last simulated window · drag to zoom, double-click to reset</p></header>
+              <div class="viz" id="timeseries"></div>
+            </article>
+            <article class="card span-2">
+              <header><h3>Power spectrum</h3><p id="spec-caption">Mean over integrations vs analytic model</p></header>
+              <div class="viz" id="spectrum"></div>
+            </article>
+            <article class="card">
+              <header><h3>Sample distribution</h3><p>Last window vs Gaussian of equal variance</p></header>
+              <div class="viz" id="histogram"></div>
+            </article>
+            <article class="card span-3">
+              <header><h3>Waterfall</h3><p>Array-averaged power per integration window (bandpass)</p></header>
+              <div class="viz wide" id="waterfall"></div>
+            </article>
+          </div>
+        </div>
+      </section>
+
+      <!-- Imaging -->
+      <section class="tab-panel" id="tab-imaging" hidden>
+        <div class="empty-state" id="imaging-empty">
+          <h3>No images yet</h3>
+          <p>After a run, the server beamforms the simulated antenna E-fields into dirty sky images at each imaging channel.</p>
+        </div>
+        <div id="imaging-content" hidden>
+          <div class="stale" id="imaging-stale" hidden>These results come from an earlier configuration. Run again to update them.</div>
+          <div class="toolbar">
+            <div class="tool grow">
+              <label for="channel">Channel</label>
+              <input type="range" id="channel" min="0" max="0" step="1" value="0">
+              <output id="channel-out"></output>
+            </div>
+            <div class="tool">
+              <label for="img-size">Pixels</label>
+              <select id="img-size"><option>64</option><option selected>128</option><option>256</option></select>
+            </div>
+            <div class="tool">
+              <label for="img-scale">Scale</label>
+              <select id="img-scale"><option value="linear">Linear</option><option value="sqrt">Sqrt</option><option value="log">dB</option></select>
+            </div>
+            <div class="tool">
+              <label for="img-cmap">Colormap</label>
+              <select id="img-cmap"></select>
+            </div>
+            <label class="check tool"><input type="checkbox" id="img-shared" checked> Shared scale</label>
+            <label class="check tool"><input type="checkbox" id="img-overlay"> Mark brightest sources</label>
+          </div>
+          <div class="tiles" id="image-tiles"></div>
+          <div class="grid img-grid">
+            <article class="card">
+              <header><h3>Dirty image</h3><p>Beamformed from simulated E-fields, averaged over integrations</p></header>
+              <div class="viz square" id="dirty-image"></div>
+            </article>
+            <article class="card">
+              <header><h3>Expected image</h3><p>Sky model ⊛ array pattern + noise floor (calibrator as far-field point)</p></header>
+              <div class="viz square" id="expected-image"></div>
+            </article>
+            <article class="card">
+              <header><h3>Point spread function</h3><p>Array pattern at the channel frequency</p></header>
+              <div class="viz square" id="psf-image"></div>
+            </article>
+          </div>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <dialog class="modal" id="py-dialog" aria-labelledby="py-title">
+    <header class="modal-head">
+      <h2 id="py-title">Python array layout</h2>
+      <div class="tool">
+        <label for="py-example">Examples</label>
+        <select id="py-example"><option value="">Load an example…</option></select>
+      </div>
+      <button class="icon-btn" id="py-close" aria-label="Close">✕</button>
+    </header>
+    <div class="modal-body">
+      <section class="py-code">
+        <div id="py-editor"></div>
+        <div class="py-console" id="py-console" aria-live="polite"></div>
+      </section>
+      <section class="py-preview">
+        <div class="viz square" id="py-preview"></div>
+        <div class="py-stats" id="py-stats"></div>
+      </section>
+    </div>
+    <footer class="modal-foot">
+      <p class="note" id="py-hint">Runs <code>layout(ctx)</code> with the server's Python (<code>--python</code>) · <kbd>Ctrl</kbd>+<kbd>Enter</kbd> to run · <kbd>Ctrl</kbd>+<kbd>/</kbd> comments</p>
+      <button class="btn" id="py-run">▶ Run</button>
+      <button class="btn primary" id="py-apply" disabled>Apply to array</button>
+    </footer>
+  </dialog>
+
+  <div class="toasts" id="toasts" aria-live="polite"></div>
+  <script type="module" src="js/main.js"></script>
+</body>
+</html>

@@ -1,0 +1,36 @@
+{
+    "sources": 6144,
+    "pixels": 12288,
+    "nside": 32,
+    "frame": "lunar-farside",
+    "epoch_utc": "2026-01-01T00:00:00.000",
+    "zenith_icrs_deg": [
+        66.08332337304425,
+        20.087510855997163
+    ],
+    "zenith_galactic_deg": [
+        176.16622596626365,
+        -20.108863636752183
+    ],
+    "earth_elevation_deg": -83.32212386316093,
+    "sun_elevation_deg": -57.45413304345227,
+    "resolution": "hi",
+    "map_frequencies": [
+        15000000.0,
+        22500000.0,
+        30000000.0,
+        37500000.0,
+        45000000.0
+    ],
+    "reference_frequency": 27959394.54893511,
+    "pixel_solid_angle_sr": 0.0010226538585904274,
+    "total_flux_jy": 3060946.9428888173,
+    "alpha_percentiles": [
+        -0.49675799543096333,
+        -0.3323831773455599,
+        -0.13768932605684897
+    ],
+    "fit_rms_ln": 0.04247386614629574,
+    "pixels_with_nonpositive_samples": 98,
+    "pixels_without_fit": 6
+}
