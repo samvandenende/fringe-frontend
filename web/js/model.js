@@ -3,6 +3,10 @@
 // environment views agree with what the simulator actually computes.
 
 export const C = 299792458.0;
+/** One jansky (W m⁻² Hz⁻¹): sources are flux densities in Jy, and fringe's output samples are in √Jy. */
+export const JANSKY = 1e-26;
+/** Boltzmann's constant in Jy m² per kelvin: system noise k_B·T_sys is given in Jy m². */
+export const K_B_JY = 1.380649e-23 / JANSKY;
 
 /** Unit direction vector from right ascension / declination (radians), as Vec3::from_ra_dec. */
 export function fromRaDec(ra, dec) {
@@ -19,18 +23,37 @@ export function toRaDec(x, y, z) {
   return [ra, dec];
 }
 
-export function makeSource(ra, dec, f0, I0, alpha) {
+/**
+ * A sky source. alpha, alpha2 and alpha3 are fringe's spectral_index, spectral_index_2 and
+ * spectral_index_3 (see sourceIntensity).
+ */
+export function makeSource(ra, dec, f0, I0, alpha, alpha2 = 0, alpha3 = 0) {
   const [x, y, z] = fromRaDec(ra, dec);
-  return { ra, dec, f0, I0, alpha, x, y, z };
+  return { ra, dec, f0, I0, alpha, alpha2, alpha3, x, y, z };
 }
 
-/** Power-law intensity, as Source::intensity. */
-export const sourceIntensity = (s, f) => s.I0 * Math.pow(f / s.f0, s.alpha);
+/**
+ * Log-polynomial flux density (Jy), as Source::intensity: I0 · exp(α₁x + α₂x² + α₃x³) with
+ * x = ln(f / f0), the power law I0 (f / f0)^α₁ when α₂ = α₃ = 0.
+ */
+export function sourceIntensity(s, f) {
+  const x = Math.log(f / s.f0);
+  return s.I0 * Math.exp(x * (s.alpha + x * ((s.alpha2 || 0) + x * (s.alpha3 || 0))));
+}
+
+/** Whether a source's spectrum is curved (a non-zero second- or third-order index). */
+export const isCurved = (s) => !!(s.alpha2 || s.alpha3);
+
+/** Local spectral index d ln S / d ln f at frequency f: α₁ + 2α₂x + 3α₃x², x = ln(f / f0). */
+export function localIndex(s, f) {
+  const x = Math.log(f / s.f0);
+  return s.alpha + x * (2 * (s.alpha2 || 0) + 3 * x * (s.alpha3 || 0));
+}
 
 /** Antenna gain pattern fringe applies to sky sources: z² of the direction. */
 export const sourceGain = (s) => s.z * s.z;
 
-/** Effective aperture used for system noise: λ²/4 capped at 4 m². */
+/** Effective area used for system noise (k_B·T_sys / A_eff is received as a flux density): λ²/4 capped at 4 m². */
 export function effectiveAperture(f) {
   const lambda = C / f;
   return Math.min((lambda * lambda) / 4, 4);
@@ -43,15 +66,20 @@ export function centroid(positions) {
   return { x: x / n, y: y / n, z: z / n };
 }
 
-/** Per-bin power the calibrator adds at an antenna: gain · I / (4π d²), gain = ẑ². */
+/**
+ * Power flux density (W/m²) the calibrator delivers to an antenna: gain · P / (4π d²), gain = ẑ²,
+ * with P the transmitter's EIRP. Times a transmitter's spectral shape (transmitter.js, Jy per W/m²)
+ * this gives the per-bin power in Jy.
+ */
 export function calibratorPower(cal, p) {
   const dx = cal.position.x - p.x, dy = cal.position.y - p.y, dz = cal.position.z - p.z;
   const d2 = dx * dx + dy * dy + dz * dz;
   if (d2 === 0) return 0;
   const gain = (dz * dz) / d2;
-  return (gain * cal.intensity) / (4 * Math.PI * d2);
+  return (gain * cal.power) / (4 * Math.PI * d2);
 }
 
+/** calibratorPower (W/m²) averaged over the antennas (0 without a calibrator). */
 export function meanCalibratorPower(cal, positions) {
   if (!cal || !cal.enabled || !positions.length) return 0;
   let s = 0;
@@ -65,32 +93,44 @@ export function physicalBand(array) {
 }
 
 /**
- * Analytic expected per-bin power vs physical frequency, in fringe's intensity units.
- * Returns typed arrays for the sky, system noise, calibrator and total contributions.
+ * Analytic expected per-bin power vs physical frequency: the received flux density in Jy (sources
+ * G·S(f), noise k_B·T_sys / A_eff, calibrator flux density spread over its spectrum).
+ * Returns typed arrays for the sky, system noise, calibrators (summed in `cal`, one array per
+ * calibrator in `cals`) and total contributions. Each calibrator's `shape` is its spectral shape
+ * (see transmitter.js); without one it contributes nothing.
  */
-export function modelSpectrum(array, sources, calibrator, freqs) {
+export function modelSpectrum(array, sources, calibrators, freqs) {
   const n = freqs.length;
   const sky = new Float64Array(n), noise = new Float64Array(n), cal = new Float64Array(n), total = new Float64Array(n);
   const [lo, hi] = physicalBand(array);
-  const calPower = meanCalibratorPower(calibrator, array.antenna_positions);
-  // Group sources by (f0, alpha) is not generally possible; just loop - typed for speed.
+  const cs = calibrators.map((c) => ({ shape: c.shape, power: c.shape ? meanCalibratorPower(c, array.antenna_positions) : 0 }));
+  const cals = cs.map(() => new Float64Array(n));
+  // Group sources by spectrum is not generally possible; just loop - typed for speed.
   const m = sources.length;
-  const gI = new Float64Array(m), f0 = new Float64Array(m), al = new Float64Array(m);
+  const gI = new Float64Array(m), f0 = new Float64Array(m), a1 = new Float64Array(m), a2 = new Float64Array(m), a3 = new Float64Array(m);
   for (let i = 0; i < m; i++) {
     const s = sources[i];
-    gI[i] = sourceGain(s) * s.I0; f0[i] = s.f0; al[i] = s.alpha;
+    gI[i] = sourceGain(s) * s.I0; f0[i] = s.f0; a1[i] = s.alpha; a2[i] = s.alpha2 || 0; a3[i] = s.alpha3 || 0;
   }
   for (let k = 0; k < n; k++) {
     const f = freqs[k];
-    if (f < lo || f > hi || f <= 0) { sky[k] = noise[k] = cal[k] = total[k] = NaN; continue; }
+    if (f < lo || f > hi || f <= 0) {
+      sky[k] = noise[k] = cal[k] = total[k] = NaN;
+      for (const c of cals) c[k] = NaN;
+      continue;
+    }
     let s = 0;
-    for (let i = 0; i < m; i++) s += gI[i] * Math.pow(f / f0[i], al[i]);
+    for (let i = 0; i < m; i++) {
+      const x = Math.log(f / f0[i]);
+      s += gI[i] * Math.exp(x * (a1[i] + x * (a2[i] + x * a3[i])));
+    }
     sky[k] = s;
     noise[k] = array.system_noise_intensity / effectiveAperture(f);
-    cal[k] = calPower;
-    total[k] = s + noise[k] + calPower;
+    cal[k] = 0;
+    cs.forEach((c, j) => { cals[j][k] = c.power ? c.power * c.shape.at(f) : 0; cal[k] += cals[j][k]; });
+    total[k] = s + noise[k] + cal[k];
   }
-  return { sky, noise, cal, total };
+  return { sky, noise, cal, cals, total };
 }
 
 export function arrayStats(positions) {
@@ -198,6 +238,9 @@ function fft1d(re, im, n, stride, offset, inverse) {
   }
 }
 
+/** In-place FFT of whole arrays (power-of-two length); the inverse is unscaled. */
+export const fft = (re, im, inverse = false) => fft1d(re, im, re.length, 1, 0, inverse);
+
 function fft2d(re, im, n, inverse) {
   for (let r = 0; r < n; r++) fft1d(re, im, n, 1, r * n, inverse);
   for (let c = 0; c < n; c++) fft1d(re, im, n, n, c, inverse);
@@ -217,7 +260,7 @@ export function expectedImage({ xs, ys, sources, freq, size, noisePower }) {
   const px = size / 2;
   for (const s of sources) {
     if (s.z <= 0) continue;
-    const I = s.z * s.z * s.I0 * Math.pow(freq / s.f0, s.alpha);
+    const I = s.z * s.z * sourceIntensity(s, freq);
     const fx = (s.x + 1) * px - 0.5, fy = (s.y + 1) * px - 0.5;
     const x0 = Math.floor(fx), y0 = Math.floor(fy);
     const tx = fx - x0, ty = fy - y0;
@@ -295,35 +338,36 @@ export function serializeArray(a) {
 }
 
 const SOURCE_COLUMNS = ['right_ascension', 'declination', 'reference_frequency', 'reference_intensity', 'spectral_index'];
+/** Columns fringe reads as 0 when they are absent. */
+const OPTIONAL_SOURCE_COLUMNS = ['spectral_index_2', 'spectral_index_3'];
 
 export function parseSourcesCsv(text) {
   const lines = text.split(/\r?\n/).filter((l) => l.trim());
   if (!lines.length) return [];
   const header = lines[0].split(',').map((h) => h.trim());
   const idx = SOURCE_COLUMNS.map((c) => header.indexOf(c));
-  if (idx.some((i) => i < 0)) throw new Error(`sources CSV needs columns: ${SOURCE_COLUMNS.join(', ')}`);
+  if (idx.some((i) => i < 0)) throw new Error(`sources CSV needs columns: ${SOURCE_COLUMNS.join(', ')} (and optionally ${OPTIONAL_SOURCE_COLUMNS.join(', ')})`);
+  const opt = OPTIONAL_SOURCE_COLUMNS.map((c) => header.indexOf(c));
   return lines.slice(1).map((line, n) => {
     const cells = line.split(',');
     const v = idx.map((i) => parseFloat(cells[i]));
-    if (v.some((x) => !Number.isFinite(x))) throw new Error(`sources CSV row ${n + 2} is not numeric`);
-    return makeSource(v[0], v[1], v[2], v[3], v[4]);
+    // An empty optional cell reads as 0, like a missing column.
+    const w = opt.map((i) => (i < 0 || !cells[i] || !cells[i].trim() ? 0 : parseFloat(cells[i])));
+    if (v.some((x) => !Number.isFinite(x)) || w.some((x) => !Number.isFinite(x))) throw new Error(`sources CSV row ${n + 2} is not numeric`);
+    return makeSource(v[0], v[1], v[2], v[3], v[4], w[0], w[1]);
   });
 }
 
 export function serializeSources(sources) {
-  const rows = sources.map((s) => [s.ra, s.dec, s.f0, s.I0, s.alpha].join(','));
-  return [SOURCE_COLUMNS.join(','), ...rows].join('\n') + '\n';
+  const rows = sources.map((s) => [s.ra, s.dec, s.f0, s.I0, s.alpha, s.alpha2 || 0, s.alpha3 || 0].join(','));
+  return [[...SOURCE_COLUMNS, ...OPTIONAL_SOURCE_COLUMNS].join(','), ...rows].join('\n') + '\n';
 }
 
-export function parseCalibratorJson(text) {
-  const o = JSON.parse(text);
-  if (!o.position || !('intensity' in o)) throw new Error('calibrator file needs "position" and "intensity"');
-  return { enabled: true, position: { x: +o.position.x, y: +o.position.y, z: +o.position.z }, intensity: +o.intensity };
-}
-
-export function serializeCalibrator(c) {
-  return JSON.stringify({ position: c.position, intensity: c.intensity }, null, 2);
-}
+/** A source as the server's request DTO (fringe's sources CSV row). */
+export const sourceDto = (s) => ({
+  right_ascension: s.ra, declination: s.dec, reference_frequency: s.f0, reference_intensity: s.I0,
+  spectral_index: s.alpha, spectral_index_2: s.alpha2 || 0, spectral_index_3: s.alpha3 || 0,
+});
 
 // ---------------------------------------------------------------------------------------
 // Generators
@@ -365,7 +409,7 @@ export function ringArray(n, radius) {
   return out;
 }
 
-/** Random point sources uniformly over the upper hemisphere with power-law intensities. */
+/** Random point sources uniformly over the upper hemisphere with power-law flux densities (Jy at f0). */
 export function randomSky(n, seed, { f0 = 30e6, minI = 100, maxI = 10000, alpha = -0.7 } = {}) {
   const rnd = mulberry32(seed);
   const out = [];
@@ -380,7 +424,7 @@ export function randomSky(n, seed, { f0 = 30e6, minI = 100, maxI = 10000, alpha 
 
 /**
  * Default environment: a 32 × 32 grid with 4 m spacing (0.4 λ at 30 MHz) sampled at 120 MHz,
- * observing 15–45 MHz with 4096-sample windows. The system noise intensity is k_B × 1e30.
+ * observing 15–45 MHz with 4096-sample windows. The system noise k_B·T_sys is 1.38e7 Jy m² (T_sys = 10⁴ K).
  */
 export const defaultArray = () => ({
   sample_frequency: 120e6,
@@ -390,3 +434,48 @@ export const defaultArray = () => ({
   system_noise_intensity: 13806490,
   antenna_positions: gridArray(32, 32, 4),
 });
+
+// ---------------------------------------------------------------------------------------
+// Sky frames over time: mirrors the server's src/lunar.rs and rotation_basis in src/pipeline.rs.
+// A basis holds the local east, north and up unit vectors in the sky's base frame; a source
+// with base-frame direction v sits at (east·v, north·v, up·v) in the array frame.
+
+const RAD = Math.PI / 180;
+const TT_MINUS_UTC_S = 69.184;
+const cross3 = (a, b) => [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]];
+
+/** Local frame at the centre of the lunar far side (180°, 0°) at a UTC time (Unix seconds), in ICRS axes. */
+export function farsideBasis(unix) {
+  const d = (unix + TT_MINUS_UTC_S) / 86400 + 2440587.5 - 2451545.0;
+  const t = d / 36525;
+  const e = [0, 125.045 - 0.0529921 * d, 250.089 - 0.1059842 * d, 260.008 + 13.0120009 * d, 176.625 + 13.3407154 * d,
+    357.529 + 0.9856003 * d, 311.589 + 26.4057084 * d, 134.963 + 13.0649930 * d, 276.617 + 0.3287146 * d,
+    34.226 + 1.7484877 * d, 15.134 - 0.1589763 * d, 119.743 + 0.0036096 * d, 239.961 + 0.1643573 * d,
+    25.053 + 12.9590088 * d].map((v) => v * RAD);
+  const s = e.map(Math.sin), c = e.map(Math.cos);
+  const a0 = (269.9949 + 0.0031 * t - 3.8787 * s[1] - 0.1204 * s[2] + 0.0700 * s[3] - 0.0172 * s[4]
+    + 0.0072 * s[6] - 0.0052 * s[10] + 0.0043 * s[13]) * RAD;
+  const d0 = (66.5392 + 0.0130 * t + 1.5419 * c[1] + 0.0239 * c[2] - 0.0278 * c[3] + 0.0068 * c[4]
+    - 0.0029 * c[6] + 0.0009 * c[7] + 0.0008 * c[10] - 0.0009 * c[13]) * RAD;
+  const w = (38.3213 + 13.17635815 * d - 1.4e-12 * d * d + 3.5610 * s[1] + 0.1208 * s[2]
+    - 0.0642 * s[3] + 0.0158 * s[4] + 0.0252 * s[5] - 0.0066 * s[6] - 0.0047 * s[7]
+    - 0.0046 * s[8] + 0.0028 * s[9] + 0.0052 * s[10] + 0.0040 * s[11] + 0.0019 * s[12]
+    - 0.0044 * s[13]) * RAD;
+  const pole = [Math.cos(d0) * Math.cos(a0), Math.cos(d0) * Math.sin(a0), Math.sin(d0)];
+  const node = [-Math.sin(a0), Math.cos(a0), 0];
+  const q = cross3(pole, node);
+  const angle = w + Math.PI;
+  const up = [0, 1, 2].map((i) => node[i] * Math.cos(angle) + q[i] * Math.sin(angle));
+  return { east: cross3(pole, up), north: pole, up };
+}
+
+/** Local frame after the sky has turned by `angle` (radians, right-handed) about the unit vector `k`. */
+export function rotationBasis(k, angle) {
+  const s = Math.sin(angle), c = Math.cos(angle);
+  const X = [[0, -k[2], k[1]], [k[2], 0, -k[0]], [-k[1], k[0], 0]];
+  const row = (i) => [0, 1, 2].map((j) => c * (i === j ? 1 : 0) + s * X[i][j] + (1 - c) * k[i] * k[j]);
+  return { east: row(0), north: row(1), up: row(2) };
+}
+
+/** Base-frame direction of an array-frame vector (the inverse of applying the basis). */
+export const fromLocal = (b, [e, n, u]) => [0, 1, 2].map((i) => e * b.east[i] + n * b.north[i] + u * b.up[i]);

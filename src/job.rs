@@ -3,7 +3,9 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
-use fringe::{Array, Calibrator, Simulation, Source, Vec3};
+use base64::Engine;
+use fringe::{Array, Calibrator, Simulation, Source, Transmitter, Vec3};
+use num_complex::Complex32;
 use serde::{Deserialize, Serialize};
 
 use crate::analysis::{Accumulator, RunResult, WindowFunction};
@@ -11,7 +13,8 @@ use crate::analysis::{Accumulator, RunResult, WindowFunction};
 /// Upper bound on memory used for the per-integration E-field store kept for imaging.
 const MAX_CHANNEL_STORE_BYTES: usize = 2 << 30;
 
-/// Array model, in the same shape as fringe's array JSON files.
+/// Array model, in the same shape as fringe's array JSON files. `system_noise_intensity` is
+/// k_B T_sys in Jy m².
 #[derive(Deserialize, Serialize, Clone)]
 pub struct ArrayDto {
     pub sample_frequency: f64,
@@ -22,7 +25,8 @@ pub struct ArrayDto {
     pub antenna_positions: Vec<Vec3>,
 }
 
-/// Sky model source, in the same shape as a row of fringe's sources CSV files.
+/// Sky model source, in the same shape as a row of fringe's sources CSV files
+/// (`reference_intensity` is the flux density in Jy at `reference_frequency`).
 #[derive(Deserialize, Clone)]
 pub struct SourceDto {
     pub right_ascension: f64,
@@ -30,13 +34,103 @@ pub struct SourceDto {
     pub reference_frequency: f64,
     pub reference_intensity: f64,
     pub spectral_index: f64,
+    /// Second- and third-order spectral indices of fringe's log-polynomial spectrum; 0 when absent.
+    #[serde(default)]
+    pub spectral_index_2: f64,
+    #[serde(default)]
+    pub spectral_index_3: f64,
 }
 
-/// Calibrator, in the same shape as fringe's calibrator JSON files.
+/// Most transmit buffer samples accepted (fringe oversamples buffers 16×, up to 2^30 samples).
+const MAX_BUFFER_SAMPLES: usize = 1 << 22;
+
+/// Calibrator transmitter, as in fringe's calibrator JSON files except that the buffer is inline:
+/// base64 of raw interleaved little-endian 32-bit float IQ samples (`cf32_le`). `power` is the
+/// EIRP in W; fringe scales the buffer to radiate it whatever the buffer's RMS.
+#[derive(Deserialize, Clone)]
+pub struct TransmitterDto {
+    pub frequency: f64,
+    pub sample_rate: f64,
+    pub power: f64,
+    #[serde(default)]
+    pub bandwidth: Option<f64>,
+    #[serde(default)]
+    pub start_time: f64,
+    pub buffer: String,
+}
+
+impl TransmitterDto {
+    /// Validates the settings (mirroring `Transmitter::validate`) and decodes the buffer.
+    pub fn build(&self) -> Result<Transmitter, String> {
+        check(self.frequency.is_finite() && self.frequency >= 0.0, "transmitter frequency must be non-negative")?;
+        check(self.sample_rate.is_finite() && self.sample_rate > 0.0, "transmitter sample rate must be positive")?;
+        check(self.power.is_finite() && self.power >= 0.0, "transmitter power must be non-negative")?;
+        check(
+            self.bandwidth.is_none_or(|b| b.is_finite() && b > 0.0),
+            "transmitter bandwidth must be positive",
+        )?;
+        check(self.start_time.is_finite(), "transmitter start time must be finite")?;
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(self.buffer.trim())
+            .map_err(|e| format!("transmitter buffer: {e}"))?;
+        check(bytes.len() % 8 == 0, "transmitter buffer must hold whole cf32 samples (8 bytes each)")?;
+        let samples: Vec<Complex32> = bytes
+            .chunks_exact(8)
+            .map(|b| {
+                Complex32::new(
+                    f32::from_le_bytes([b[0], b[1], b[2], b[3]]),
+                    f32::from_le_bytes([b[4], b[5], b[6], b[7]]),
+                )
+            })
+            .collect();
+        check(!samples.is_empty(), "the transmitter buffer is empty")?;
+        check(
+            samples.len() <= MAX_BUFFER_SAMPLES,
+            &format!("the transmitter buffer may hold at most {MAX_BUFFER_SAMPLES} samples"),
+        )?;
+        check(samples.iter().all(|s| s.is_finite()), "transmitter buffer samples must be finite")?;
+        check(
+            samples.iter().any(|s| s.norm_sqr() > 0.0),
+            "the transmitter buffer is all zeros",
+        )?;
+        Ok(Transmitter::new(self.frequency, self.sample_rate, self.power, samples, self.bandwidth, self.start_time))
+    }
+}
+
+/// Calibrator, in the same shape as fringe's calibrator JSON files (with an inline buffer). It
+/// moves with constant acceleration from `position` and `velocity` at the start of the run.
 #[derive(Deserialize, Clone)]
 pub struct CalibratorDto {
+    /// Label for messages and saved files; "calibrator k" (counting from 1) when absent.
+    #[serde(default)]
+    pub name: Option<String>,
     pub position: Vec3,
-    pub intensity: f64,
+    #[serde(default)]
+    pub velocity: Vec3,
+    #[serde(default)]
+    pub acceleration: Vec3,
+    pub transmitter: TransmitterDto,
+}
+
+/// Most calibrators a run may simulate at once.
+pub const MAX_CALIBRATORS: usize = 64;
+
+/// A calibrator's label: its name, or "calibrator k" for the k-th (counting from 0).
+pub fn calibrator_label(name: Option<&str>, k: usize) -> String {
+    name.map(str::trim).filter(|n| !n.is_empty()).map_or_else(|| format!("calibrator {}", k + 1), str::to_string)
+}
+
+/// Checks a calibrator state against fringe's asserts and the array.
+pub fn check_state(position: Vec3, velocity: Vec3, acceleration: Vec3, antennas: &[Vec3]) -> Result<(), String> {
+    let finite = |v: Vec3| v.x.is_finite() && v.y.is_finite() && v.z.is_finite();
+    check(finite(position), "position must be finite")?;
+    check(finite(velocity), "velocity must be finite")?;
+    check(finite(acceleration), "acceleration must be finite")?;
+    check(velocity.norm() < 299_792_458.0, "speed must be below the speed of light")?;
+    check(
+        antennas.iter().all(|p| (position - *p).norm() > 0.0),
+        "the calibrator may not coincide with an antenna",
+    )
 }
 
 #[derive(Deserialize, Clone)]
@@ -54,7 +148,8 @@ pub struct RunRequest {
     pub integrations: usize,
     pub array: ArrayDto,
     pub sources: Vec<SourceDto>,
-    pub calibrator: Option<CalibratorDto>,
+    #[serde(default)]
+    pub calibrators: Vec<CalibratorDto>,
     pub analysis: AnalysisDto,
 }
 
@@ -67,7 +162,7 @@ pub struct ValidatedRequest {
     pub array_dto: ArrayDto,
     pub array: Array,
     pub sources: Vec<Source>,
-    pub calibrator: Option<Calibrator>,
+    pub calibrators: Vec<Calibrator>,
     pub analysis: AnalysisDto,
 }
 
@@ -91,6 +186,8 @@ impl JobState {
 #[derive(Serialize, Clone)]
 pub struct JobStatus {
     pub run_id: u64,
+    /// "simulation" or "pipeline": which result endpoint holds the output.
+    pub kind: &'static str,
     pub state: JobState,
     pub completed: usize,
     pub total: usize,
@@ -102,6 +199,7 @@ impl JobStatus {
     pub fn idle() -> Self {
         JobStatus {
             run_id: 0,
+            kind: "simulation",
             state: JobState::Idle,
             completed: 0,
             total: 0,
@@ -194,34 +292,35 @@ impl RunRequest {
                     &format!("source {i}: reference intensity must be non-negative"),
                 )?;
                 check(
-                    s.spectral_index.is_finite(),
-                    &format!("source {i}: spectral index must be finite"),
+                    s.spectral_index.is_finite() && s.spectral_index_2.is_finite() && s.spectral_index_3.is_finite(),
+                    &format!("source {i}: spectral indices must be finite"),
                 )?;
                 Ok(Source::new(
                     Vec3::from_ra_dec(s.right_ascension, s.declination),
                     s.reference_frequency,
                     s.reference_intensity,
                     s.spectral_index,
+                    s.spectral_index_2,
+                    s.spectral_index_3,
                 ))
             })
             .collect::<Result<Vec<_>, String>>()?;
 
-        let calibrator = match &self.calibrator {
-            Some(c) => {
-                check(
-                    c.intensity.is_finite() && c.intensity >= 0.0,
-                    "calibrator intensity must be non-negative",
-                )?;
-                check(
-                    a.antenna_positions
-                        .iter()
-                        .all(|p| (c.position - *p).norm() > 0.0),
-                    "the calibrator may not coincide with an antenna",
-                )?;
-                Some(Calibrator::new(c.position, c.intensity))
-            }
-            None => None,
-        };
+        check(
+            self.calibrators.len() <= MAX_CALIBRATORS,
+            &format!("at most {MAX_CALIBRATORS} calibrators are supported"),
+        )?;
+        let calibrators = self
+            .calibrators
+            .iter()
+            .enumerate()
+            .map(|(k, c)| {
+                let label = |e: String| format!("{}: {e}", calibrator_label(c.name.as_deref(), k));
+                check_state(c.position, c.velocity, c.acceleration, &a.antenna_positions).map_err(label)?;
+                let transmitter = c.transmitter.build().map_err(label)?;
+                Ok(Calibrator::new(c.position, transmitter, Some(c.velocity), Some(c.acceleration), 0.0))
+            })
+            .collect::<Result<Vec<_>, String>>()?;
 
         check(
             (1..=1024).contains(&self.analysis.channels),
@@ -250,7 +349,7 @@ impl RunRequest {
             array_dto: self.array,
             array,
             sources,
-            calibrator,
+            calibrators,
             analysis: self.analysis,
         })
     }
@@ -276,8 +375,8 @@ pub fn execute(
         Some(req.rng_seed),
     );
     simulation.set_sources(req.sources.clone());
-    if let Some(calibrator) = &req.calibrator {
-        simulation.set_calibrator(calibrator.clone());
+    if !req.calibrators.is_empty() {
+        simulation.set_calibrators(req.calibrators.clone());
     }
     let init_s = started.elapsed().as_secs_f64();
 
@@ -287,7 +386,8 @@ pub fn execute(
 
     let loop_started = Instant::now();
     let mut window_started = Instant::now();
-    simulation.start();
+    // Windows follow each other back to back from t = 0 (the calibrators' epoch).
+    simulation.start(Some(0.0));
     on_progress(JobState::Running, 0);
     for n in 0..req.integrations {
         let window = simulation.finish();
@@ -296,7 +396,7 @@ pub fn execute(
 
         let more = n + 1 < req.integrations && !cancel.load(Ordering::Relaxed);
         if more {
-            simulation.start();
+            simulation.start(None);
         }
         accumulator.add(&window);
         on_progress(JobState::Running, n + 1);

@@ -1,8 +1,11 @@
 import * as M from './model.js';
 import { LinePlot, ImagePlot, COLORMAPS, si, fmt } from './plot.js';
 import { SceneView, ArrayView, SkyView } from './views.js';
-import { CodeEditor } from './editor.js';
+import { createPythonDialog } from './pydialog.js';
 import { LAYOUT_EXAMPLES } from './layouts.js';
+import { initTimeline } from './timeline.js';
+import { initOutputs } from './outputs.js';
+import { initTransmitter, readFringeCalibrators, fringeCalibratorJson, serializeCf32, newTransmitter } from './transmitter.js';
 
 const $ = (id) => document.getElementById(id);
 const MHz = (f) => `${+(f / 1e6).toFixed(3)} MHz`;
@@ -11,10 +14,31 @@ const DEG = 180 / Math.PI;
 // ---------------------------------------------------------------------------------------
 // State
 
+/** Colours of calibrators by index (theme series tokens), repeating after the fourth. */
+const CAL_COLORS = ['s3', 's4', 's5', 's6'];
+
+/**
+ * A calibrator: off, kinematic ('fixed': a state at the start epoch in the array frame, then
+ * constant acceleration) or a series (one state per integration, see timeline.js), with its
+ * fringe Transmitter settings and cyclic buffer (see transmitter.js). Names and colours follow the
+ * calibrator's place in the list (renumberCalibrators).
+ */
+function newCalibrator(overrides = {}) {
+  return {
+    name: '', color: '', mode: 'off',
+    position: { x: 62, y: 62, z: 150 }, velocity: { x: 0, y: 0, z: 0 }, acceleration: { x: 0, y: 0, z: 0 },
+    transmitter: newTransmitter(),
+    series: { rows: [], source: '', python: null, pythonPending: false, origin: 'centroid', doppler: true },
+    ...overrides,
+  };
+}
+
 const state = {
   array: M.defaultArray(),
   sources: [],
-  calibrator: { enabled: false, position: { x: 62, y: 62, z: 150 }, intensity: 1e12 },
+  calibrators: [newCalibrator()],
+  // Index of the calibrator the sidebar edits.
+  activeCal: 0,
   runtime: 'gpu',
   viewFreq: 30e6,
   cmap: 'plasma',
@@ -29,8 +53,8 @@ const state = {
   rates: {}, // measured source·bin evaluations per second, per runtime
   gsmAvailable: false,
   skyOrigin: '',
-  pythonLayout: false,
-  pythonLayoutDisabled: null,
+  python: false,
+  pythonDisabled: null,
 };
 
 // ---------------------------------------------------------------------------------------
@@ -54,6 +78,7 @@ async function api(path, options) {
   return res.status === 204 ? null : res.json();
 }
 
+/** Saves text or binary data (an ArrayBuffer) as a file. */
 function download(name, text, type) {
   const url = URL.createObjectURL(new Blob([text], { type }));
   const a = Object.assign(document.createElement('a'), { href: url, download: name });
@@ -148,16 +173,16 @@ const beamView = new ImagePlot($('beam-view'), {
   hoverExtra: directionTip,
 });
 const modelPlot = new LinePlot($('model-spectrum'), {
-  xLabel: 'frequency (MHz)', yLabel: 'power per bin', yLog: true, yFloorRatio: 1e5, empty: 'No bandpass',
+  xLabel: 'frequency (MHz)', yLabel: 'power per bin (Jy)', yLog: true, yFloorRatio: 1e5, empty: 'No bandpass',
 });
 const powerMap = new ArrayView($('power-map'), { onSelect: (i) => selectAntenna(i) });
-const tsPlot = new LinePlot($('timeseries'), { xLabel: 'time (µs)', yLabel: 'amplitude' });
-const specPlot = new LinePlot($('spectrum'), { xLabel: 'frequency (MHz)', yLabel: 'power per bin', yLog: true, yFloorRatio: 1e4 });
+const tsPlot = new LinePlot($('timeseries'), { xLabel: 'time (µs)', yLabel: 'amplitude (√Jy)' });
+const specPlot = new LinePlot($('spectrum'), { xLabel: 'frequency (MHz)', yLabel: 'power per bin (Jy)', yLog: true, yFloorRatio: 1e4 });
 const histPlot = new LinePlot($('histogram'), { xLabel: 'sample value', yLabel: 'probability density', yZero: true });
 const waterfall = new ImagePlot($('waterfall'), {
   scale: 'log', robust: true, xLabel: 'frequency (MHz)', yLabel: 'integration', cbLabel: 'power (dB)', yFormat: (v) => fmt(v, 3),
 });
-const imgOpts = { sky: true, xLabel: 'l', yLabel: 'm', cbLabel: 'apparent intensity', hoverExtra: directionTip };
+const imgOpts = { sky: true, xLabel: 'l', yLabel: 'm', cbLabel: 'apparent flux density (Jy)', hoverExtra: directionTip };
 const dirtyImage = new ImagePlot($('dirty-image'), { ...imgOpts, empty: 'Loading…', overlay: (...a) => drawImageOverlay(...a) });
 const expectedImage = new ImagePlot($('expected-image'), { ...imgOpts, empty: 'Computing…', overlay: (...a) => drawImageOverlay(...a) });
 const psfImage = new ImagePlot($('psf-image'), { sky: true, scale: 'log', dynamicRange: 30, xLabel: 'Δl', yLabel: 'Δm', cbLabel: 'relative power', empty: 'Computing…' });
@@ -184,6 +209,13 @@ function writeArrayInputs() {
   }
   $('window-size').value = String(a.sample_window_size);
   $('noise').value = a.system_noise_intensity;
+  renderNoiseNote();
+}
+
+/** The system noise as a temperature (k_B·T_sys is given in Jy m²). */
+function renderNoiseNote() {
+  const t = state.array.system_noise_intensity / M.K_B_JY;
+  $('noise-note').textContent = Number.isFinite(t) ? `T_sys = ${t >= 1e5 || t < 1 ? fmt(t, 3) : Math.round(t).toLocaleString()} K` : '';
 }
 
 function readArrayInputs() {
@@ -193,21 +225,105 @@ function readArrayInputs() {
   a.bandpass = [parseFloat($('bp-min').value) * 1e6, parseFloat($('bp-max').value) * 1e6];
   a.sample_window_size = parseInt($('window-size').value, 10);
   a.system_noise_intensity = parseFloat($('noise').value);
+  renderNoiseNote();
   envChanged();
 }
 
-function writeCalibratorInputs() {
-  const c = state.calibrator;
-  $('cal-enabled').checked = c.enabled;
-  $('cal-x').value = c.position.x; $('cal-y').value = c.position.y; $('cal-z').value = c.position.z;
-  $('cal-i').value = c.intensity;
+const KINEMATICS = [['position', 'cal-'], ['velocity', 'cal-v'], ['acceleration', 'cal-a']];
+
+const activeCal = () => state.calibrators[state.activeCal];
+const enabledCals = () => state.calibrators.filter((c) => c.mode !== 'off');
+
+function renumberCalibrators() {
+  state.calibrators.forEach((c, i) => { c.name = `C${i + 1}`; c.color = CAL_COLORS[i % CAL_COLORS.length]; });
 }
 
+function writeCalibratorInputs() {
+  const c = activeCal();
+  for (const [key, prefix] of KINEMATICS) for (const axis of 'xyz') $(`${prefix}${axis}`).value = +c[key][axis].toPrecision(12);
+}
+
+const calibratorChanged = debounce(() => timeline && timeline.refresh(), 120);
+
 function readCalibratorInputs() {
-  const c = state.calibrator;
-  c.enabled = $('cal-enabled').checked;
-  c.position = { x: parseFloat($('cal-x').value) || 0, y: parseFloat($('cal-y').value) || 0, z: parseFloat($('cal-z').value) || 0 };
-  c.intensity = Math.max(0, parseFloat($('cal-i').value) || 0);
+  const c = activeCal();
+  for (const [key, prefix] of KINEMATICS) {
+    c[key] = Object.fromEntries([...'xyz'].map((axis) => [axis, parseFloat($(`${prefix}${axis}`).value) || 0]));
+  }
+  calibratorChanged();
+  envChanged();
+}
+
+const MODE_NAMES = { off: 'off', fixed: 'kinematic', series: 'series' };
+
+/** The calibrator chips, and the controls of the selected calibrator. */
+function renderCalibratorPanel() {
+  const cal = activeCal();
+  const chips = state.calibrators.map((c, i) => {
+    const b = document.createElement('button');
+    b.className = `cal-chip${i === state.activeCal ? ' on' : ''}${c.mode === 'off' ? ' off' : ''}`;
+    b.setAttribute('role', 'tab');
+    b.setAttribute('aria-selected', String(i === state.activeCal));
+    b.style.setProperty('--c', `var(--series-${c.color.slice(1)})`);
+    b.innerHTML = `<span class="swatch"></span>${c.name} <span class="mode">${MODE_NAMES[c.mode]}</span>`;
+    b.addEventListener('click', () => selectCalibrator(i));
+    return b;
+  });
+  const add = Object.assign(document.createElement('button'), { className: 'cal-chip add', textContent: '+ Add', title: 'Add a calibrator' });
+  add.addEventListener('click', addCalibrator);
+  $('cal-list').replaceChildren(...chips, add);
+  document.querySelectorAll('#cal-mode button').forEach((b) => b.classList.toggle('on', b.dataset.value === cal.mode));
+  $('cal-fixed').hidden = cal.mode !== 'fixed';
+  $('cal-series').hidden = cal.mode !== 'series';
+  $('cal-common').hidden = cal.mode === 'off';
+  $('cal-remove').disabled = state.calibrators.length < 2;
+  $('cal-remove').textContent = `Remove ${cal.name}`;
+  $('cal-skip-label').hidden = !enabledCals().length;
+  writeCalibratorInputs();
+  if (transmitter) transmitter.write();
+  if (timeline) timeline.writeSeriesControls();
+}
+
+/** Calibrator off, kinematic (a state at the start epoch) or a series (one state per integration). */
+function setCalMode(mode) {
+  activeCal().mode = mode;
+  renderCalibratorPanel();
+  if (timeline) timeline.refresh();
+  envChanged();
+}
+
+function selectCalibrator(i) {
+  state.activeCal = Math.max(0, Math.min(state.calibrators.length - 1, i));
+  renderCalibratorPanel();
+  // The timeline's comparison frequency follows the selected calibrator.
+  if (timeline) timeline.refresh();
+}
+
+/**
+ * Adds a kinematic calibrator next to the array (a quarter turn round from the previous one) with
+ * the selected calibrator's transmitter settings and its own noise buffer, and selects it.
+ */
+function addCalibrator() {
+  const src = activeCal().transmitter;
+  const c = M.centroid(state.array.antenna_positions);
+  const angle = (Math.PI / 2) * (state.calibrators.length - 1);
+  const pick = ({ frequency, sampleRate, power, bandwidth, startTime, length, degree }) => ({ frequency, sampleRate, power, bandwidth, startTime, length, degree });
+  const seed = Math.max(...state.calibrators.map((k) => k.transmitter.seed || 0)) + 1;
+  state.calibrators.push(newCalibrator({
+    mode: 'fixed',
+    position: { x: +(c.x + 60 * Math.cos(angle)).toFixed(2), y: +(c.y + 60 * Math.sin(angle)).toFixed(2), z: 150 },
+    transmitter: newTransmitter({ ...pick(src), seed }),
+  }));
+  renumberCalibrators();
+  selectCalibrator(state.calibrators.length - 1);
+  envChanged();
+}
+
+function removeCalibrator() {
+  if (state.calibrators.length < 2) return;
+  state.calibrators.splice(state.activeCal, 1);
+  renumberCalibrators();
+  selectCalibrator(Math.min(state.activeCal, state.calibrators.length - 1));
   envChanged();
 }
 
@@ -259,31 +375,56 @@ function editedOrigin() {
 /** Loads the bundled default sky: GSM2016 on the lunar far side, generated by scripts/gsm_sky.py. */
 async function loadDefaultSky() {
   const [csv, meta] = await Promise.all([
-    fetch('data/default_sky.csv').then((r) => { if (!r.ok) throw new Error('default sky model unavailable'); return r.text(); }),
-    fetch('data/default_sky.json').then((r) => (r.ok ? r.json() : null)).catch(() => null),
+    // Always revalidate: a hard reload does not cover fetches, so a copy cached before the server
+    // sent Cache-Control could otherwise outlive a regenerated sky.
+    fetch('data/default_sky.csv', { cache: 'no-cache' }).then((r) => { if (!r.ok) throw new Error('default sky model unavailable'); return r.text(); }),
+    fetch('data/default_sky.json', { cache: 'no-cache' }).then((r) => (r.ok ? r.json() : null)).catch(() => null),
   ]);
   const epoch = meta && meta.epoch_utc ? ` at ${meta.epoch_utc.replace('T', ' ').replace(/:00(\.000)?$/, '')} UTC` : '';
   setSky(M.parseSourcesCsv(csv), meta
-    ? `Default: GSM2016, NSIDE ${meta.nside}, lunar far side${epoch}, α fitted over ${meta.map_frequencies.length} maps`
+    ? `Default: GSM2016, NSIDE ${meta.nside}, lunar far side${epoch}, ${gsmFitText({ order: meta.spectral_order || 1 })} fitted over ${meta.map_frequencies.length} maps`
     : 'Default sky model');
 }
 
-function setCalibratorPreset(kind) {
+/**
+ * Circular orbit state about a body whose centre is `depth` below the array centroid `c`: the
+ * position at elevation `el` and azimuth `az` (from +y towards +x), `altitude` above the surface,
+ * moving horizontally towards azimuth `heading`, with its centripetal acceleration.
+ */
+function orbitState(c, { radius, gm, altitude, el, az, heading }) {
+  const centre = [c.x, c.y, c.z - radius];
+  const r = radius + altitude;
+  // Range from the array along (el, az) to the sphere of radius r about the centre.
+  const u = [Math.cos(el) * Math.sin(az), Math.cos(el) * Math.cos(az), Math.sin(el)];
+  const range = -radius * u[2] + Math.sqrt((radius * u[2]) ** 2 + r * r - radius * radius);
+  const p = [c.x + range * u[0], c.y + range * u[1], c.z + range * u[2]];
+  const rad = p.map((v, i) => (v - centre[i]) / r);
+  // Horizontal direction of motion at the satellite: the heading projected onto its local horizon.
+  const h = [Math.sin(heading), Math.cos(heading), 0];
+  const along = h.map((v, i) => v - (h[0] * rad[0] + h[1] * rad[1] + h[2] * rad[2]) * rad[i]);
+  const norm = Math.hypot(...along);
+  const speed = Math.sqrt(gm / r), g = gm / (r * r);
+  const round = (v, d) => +v.toFixed(d);
+  const vec = (a, d) => ({ x: round(a[0], d), y: round(a[1], d), z: round(a[2], d) });
+  return {
+    position: vec(p, 1),
+    velocity: vec(along.map((v) => (speed * v) / norm), 2),
+    acceleration: vec(rad.map((v) => -g * v), 4),
+  };
+}
+
+async function setCalibratorPreset(kind) {
   const c = M.centroid(state.array.antenna_positions);
-  const cal = state.calibrator;
-  if (kind === 'drone') cal.position = { x: +c.x.toFixed(2), y: +c.y.toFixed(2), z: 150 };
-  else {
-    const d = 550e3, el = 60 / DEG, az = 30 / DEG;
-    cal.position = { x: Math.round(c.x + d * Math.cos(el) * Math.cos(az)), y: Math.round(c.y + d * Math.cos(el) * Math.sin(az)), z: Math.round(d * Math.sin(el)) };
-  }
-  // Pick an intensity that puts the calibrator at the level of sky + noise at band centre.
-  const f = (M.physicalBand(state.array)[0] + M.physicalBand(state.array)[1]) / 2;
-  const m = M.modelSpectrum(state.array, state.sources, { enabled: false }, [f]);
-  const unit = M.meanCalibratorPower({ enabled: true, position: cal.position, intensity: 1 }, state.array.antenna_positions);
-  if (unit > 0 && Number.isFinite(m.total[0])) cal.intensity = +(m.total[0] / unit).toPrecision(3);
-  cal.enabled = true;
-  writeCalibratorInputs();
-  envChanged();
+  const zero = { x: 0, y: 0, z: 0 };
+  let s;
+  if (kind === 'drone') s = { position: { x: +c.x.toFixed(2), y: +c.y.toFixed(2), z: 150 }, velocity: zero, acceleration: zero };
+  else if (kind === 'lunar') s = orbitState(c, { radius: 1737.4e3, gm: 4.9028e12, altitude: 100e3, el: Math.PI / 2, az: 0, heading: 30 / DEG });
+  else s = orbitState(c, { radius: 6371e3, gm: 3.986004e14, altitude: 550e3, el: 30 / DEG, az: 30 / DEG, heading: 210 / DEG });
+  const cal = activeCal();
+  Object.assign(cal, s);
+  setCalMode('fixed');
+  await timeline.refresh();
+  timeline.autoPower(cal);
 }
 
 function renderSourceList() {
@@ -293,10 +434,19 @@ function renderSourceList() {
     .sort((a, b) => b.v - a.v)
     .slice(0, 6);
   const el = $('source-list');
-  if (!top.length) { el.innerHTML = '<p class="note">No sources. The simulation will contain system noise (and the calibrator) only.</p>'; return; }
+  if (!top.length) { el.innerHTML = '<p class="note">No sources. The simulation will contain system noise (and any calibrators) only.</p>'; return; }
+  // Higher-order columns only when the sky has curved spectra, so they do not come and go with the view frequency.
+  const curved = state.sources.some(M.isCurved);
+  const idx = (v) => `<td>${(Math.abs(v || 0) < 0.005 ? 0 : v).toFixed(2)}</td>`; // no "-0.00"
   el.innerHTML = `<div class="head">Brightest (apparent at ${MHz(f)})</div>
-    <table><tr><th>RA°</th><th>Dec°</th><th>I(f)</th><th>α</th><th></th></tr>
-    ${top.map(({ s, v }, i) => `<tr><td>${(s.ra * DEG).toFixed(1)}</td><td>${(s.dec * DEG).toFixed(1)}</td><td>${fmt(v, 3)}</td><td>${s.alpha.toFixed(2)}</td><td><button class="rm" data-i="${i}" title="Remove source" aria-label="Remove source">×</button></td></tr>`).join('')}
+    <table class="${curved ? 'curved' : ''}"><tr><th>RA°</th><th>Dec°</th><th title="Apparent flux density G·S(f)">Jy</th>` +
+    (curved
+      ? '<th title="First-order (power-law) spectral index">α₁</th><th title="Second-order spectral index (curvature)">α₂</th><th title="Third-order spectral index">α₃</th>'
+      : '<th title="Spectral index">α</th>') +
+    `<th></th></tr>
+    ${top.map(({ s, v }, i) => `<tr><td>${(s.ra * DEG).toFixed(1)}</td><td>${(s.dec * DEG).toFixed(1)}</td><td>${fmt(v, 3)}</td>` +
+      idx(s.alpha) + (curved ? idx(s.alpha2) + idx(s.alpha3) : '') +
+      `<td><button class="rm" data-i="${i}" title="Remove source" aria-label="Remove source">×</button></td></tr>`).join('')}
     </table>`;
   el.querySelectorAll('.rm').forEach((b) => b.addEventListener('click', () => {
     const target = top[+b.dataset.i].s;
@@ -305,129 +455,75 @@ function renderSourceList() {
 }
 
 // ---------------------------------------------------------------------------------------
-// Python array layouts (run server-side with the user's Python)
+// Python array layouts (run server-side with the user's Python; dialog in pydialog.js)
 
-const py = { editor: null, preview: null, positions: null, running: false };
+let pythonDialog = null;
 
-function openPythonDialog() {
-  if (!py.editor) initPythonDialog();
-  $('py-dialog').showModal();
-  py.editor.ta.focus();
-  if (!py.positions && state.pythonLayout) runPythonLayout();
-  else renderPythonPreview(py.positions || state.array.antenna_positions, !py.positions);
-}
+const layoutKind = {
+  title: 'Python array layout',
+  fn: 'layout',
+  what: 'antennas',
+  applyLabel: 'Apply to array',
+  storageKey: 'fringe.layoutCode',
+  examples: LAYOUT_EXAMPLES,
+  context() {
+    const a = state.array;
+    const [fmin, fmax] = M.physicalBand(a);
+    return {
+      sample_frequency: a.sample_frequency,
+      downmix_frequency: a.downmix_frequency,
+      bandpass: a.bandpass,
+      fmin,
+      fmax,
+      sample_window_size: a.sample_window_size,
+      positions: a.antenna_positions.map((p) => [p.x, p.y, p.z]),
+    };
+  },
+  mountPreview(el) {
+    el.innerHTML = '<div class="viz square"></div><div class="py-stats"></div>';
+    const view = new ArrayView(el.firstChild);
+    allViews.push(view);
+    const stats = el.lastChild;
+    return {
+      /** The layout() result, or the current array when there is none. */
+      show(result) {
+        const positions = result ? result.positions : state.array.antenna_positions;
+        view.set({ positions, calibrators: [] });
+        const s = M.arrayStats(positions);
+        const [, fmax] = M.physicalBand(state.array);
+        const halfLambda = M.C / fmax / 2;
+        const rows = [
+          ['Showing', result ? 'layout() result' : 'current array'],
+          ['Antennas', `${s.n.toLocaleString()}${result ? ` (current: ${state.array.antenna_positions.length.toLocaleString()})` : ''}`],
+          ['Extent', `${si(s.maxX - s.minX, 3, 'm')} × ${si(s.maxY - s.minY, 3, 'm')}`],
+          ['Longest baseline', si(s.maxBaseline, 4, 'm')],
+        ];
+        if (Number.isFinite(s.minSpacing)) {
+          if (s.minSpacing === 0) rows.push(['Min. spacing', 'coincident antennas', 'warn']);
+          else if (s.minSpacing > halfLambda) rows.push(['Min. spacing', `${si(s.minSpacing, 3, 'm')} · grating lobes above ${MHz(M.C / (2 * s.minSpacing))}`, 'warn']);
+          else rows.push(['Min. spacing', `${si(s.minSpacing, 3, 'm')} (≤ λ_min/2 = ${si(halfLambda, 3, 'm')})`]);
+        }
+        rows.push(['Geometry', s.planar ? 'planar' : `non-planar (Δz ${si(s.maxZ - s.minZ, 3, 'm')})`]);
+        stats.innerHTML = `<dl>${rows.map(([k, v, cls]) => `<dt>${k}</dt><dd class="${cls || ''}">${v}</dd>`).join('')}</dl>`;
+      },
+    };
+  },
+  apply(result) {
+    state.array.antenna_positions = result.positions;
+    state.antenna = 0;
+    envChanged();
+    toast(`Array layout set from Python: ${result.positions.length.toLocaleString()} antennas`, 'ok');
+  },
+};
 
-function initPythonDialog() {
-  let saved = null;
-  try { saved = localStorage.getItem('fringe.layoutCode'); } catch { /* storage unavailable */ }
-  const save = debounce((code) => { try { localStorage.setItem('fringe.layoutCode', code); } catch { /* storage unavailable */ } }, 300);
-  py.editor = new CodeEditor($('py-editor'), { value: saved || LAYOUT_EXAMPLES[0].code, onRun: runPythonLayout, onChange: save });
-  py.preview = new ArrayView($('py-preview'));
-  allViews.push(py.preview);
-  LAYOUT_EXAMPLES.forEach((ex, i) => $('py-example').add(new Option(ex.name, String(i))));
-  $('py-example').addEventListener('change', (e) => {
-    if (e.target.value === '') return;
-    py.editor.setValue(LAYOUT_EXAMPLES[+e.target.value].code); // undoable with Ctrl+Z
-    e.target.value = '';
-  });
-  $('py-run').addEventListener('click', runPythonLayout);
-  $('py-apply').addEventListener('click', applyPythonLayout);
-  $('py-close').addEventListener('click', () => $('py-dialog').close());
-  if (!state.pythonLayout) {
-    $('py-run').disabled = true;
-    pyConsole([[state.pythonLayoutDisabled || 'Python layouts are unavailable on this server.', 'err']]);
-  } else {
-    pyConsole([['Press Run (Ctrl+Enter) to execute layout(ctx).', 'muted']]);
+function openPythonDialog(kind) {
+  if (!pythonDialog) {
+    pythonDialog = createPythonDialog(
+      { api, available: () => ({ ok: state.python, reason: state.pythonDisabled }) },
+      { layout: layoutKind, calibrator: timeline.pythonKind, transmitter: transmitter.pythonKind },
+    );
   }
-}
-
-function pyConsole(parts) {
-  const el = $('py-console');
-  el.innerHTML = '';
-  for (const [text, cls] of parts) {
-    const span = document.createElement('span');
-    if (cls) span.className = cls;
-    span.textContent = text.endsWith('\n') ? text : text + '\n';
-    el.appendChild(span);
-  }
-  el.scrollTop = el.scrollHeight;
-}
-
-function pythonContext() {
-  const a = state.array;
-  const [fmin, fmax] = M.physicalBand(a);
-  return {
-    sample_frequency: a.sample_frequency,
-    downmix_frequency: a.downmix_frequency,
-    bandpass: a.bandpass,
-    fmin,
-    fmax,
-    sample_window_size: a.sample_window_size,
-    positions: a.antenna_positions.map((p) => [p.x, p.y, p.z]),
-  };
-}
-
-async function runPythonLayout() {
-  if (py.running || !state.pythonLayout) return;
-  py.running = true;
-  $('py-run').disabled = true;
-  $('py-run').textContent = 'Running…';
-  try {
-    const res = await api('/array/python', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ code: py.editor.value, context: pythonContext() }),
-    });
-    const parts = res.stdout ? [[res.stdout, '']] : [];
-    if (res.error) {
-      py.positions = null;
-      parts.push([res.error, 'err']);
-      const shown = $('py-stats').querySelector('dd');
-      if (shown && shown.textContent === 'layout() result') shown.textContent = 'last successful result';
-    } else {
-      py.positions = res.positions.map(([x, y, z]) => ({ x, y, z }));
-      parts.push([`✓ layout() returned ${py.positions.length.toLocaleString()} antennas in ${si(res.elapsed_s, 3, 's')}`, 'ok']);
-      renderPythonPreview(py.positions, false);
-    }
-    pyConsole(parts);
-  } catch (e) {
-    py.positions = null;
-    pyConsole([[e.message, 'err']]);
-  } finally {
-    py.running = false;
-    $('py-run').disabled = false;
-    $('py-run').textContent = '▶ Run';
-    $('py-apply').disabled = !py.positions;
-  }
-}
-
-function renderPythonPreview(positions, isCurrent) {
-  py.preview.set({ positions, calibrator: null });
-  const s = M.arrayStats(positions);
-  const [, fmax] = M.physicalBand(state.array);
-  const halfLambda = M.C / fmax / 2;
-  const rows = [
-    ['Showing', isCurrent ? 'current array' : 'layout() result'],
-    ['Antennas', `${s.n.toLocaleString()}${isCurrent ? '' : ` (current: ${state.array.antenna_positions.length.toLocaleString()})`}`],
-    ['Extent', `${si(s.maxX - s.minX, 3, 'm')} × ${si(s.maxY - s.minY, 3, 'm')}`],
-    ['Longest baseline', si(s.maxBaseline, 4, 'm')],
-  ];
-  if (Number.isFinite(s.minSpacing)) {
-    if (s.minSpacing === 0) rows.push(['Min. spacing', 'coincident antennas', 'warn']);
-    else if (s.minSpacing > halfLambda) rows.push(['Min. spacing', `${si(s.minSpacing, 3, 'm')} · grating lobes above ${MHz(M.C / (2 * s.minSpacing))}`, 'warn']);
-    else rows.push(['Min. spacing', `${si(s.minSpacing, 3, 'm')} (≤ λ_min/2 = ${si(halfLambda, 3, 'm')})`]);
-  }
-  rows.push(['Geometry', s.planar ? 'planar' : `non-planar (Δz ${si(s.maxZ - s.minZ, 3, 'm')})`]);
-  $('py-stats').innerHTML = `<dl>${rows.map(([k, v, cls]) => `<dt>${k}</dt><dd class="${cls || ''}">${v}</dd>`).join('')}</dl>`;
-}
-
-function applyPythonLayout() {
-  if (!py.positions) return;
-  state.array.antenna_positions = py.positions;
-  state.antenna = 0;
-  envChanged();
-  $('py-dialog').close();
-  toast(`Array layout set from Python: ${py.positions.length.toLocaleString()} antennas`, 'ok');
+  pythonDialog.open(kind);
 }
 
 // ---------------------------------------------------------------------------------------
@@ -439,6 +535,7 @@ function gsmParams() {
   return {
     nside: parseInt($('gsm-nside').value, 10),
     maps: parseInt($('gsm-maps').value, 10),
+    order: parseInt($('gsm-order').value, 10),
     fmin: mhz('gsm-fmin') || Math.max(10e6, lo),
     fmax: mhz('gsm-fmax') || hi,
     frame: $('gsm-frame').value,
@@ -446,6 +543,11 @@ function gsmParams() {
     resolution: $('gsm-resolution').value,
     above_horizon: $('gsm-horizon').checked,
   };
+}
+
+/** The spectrum a GSM fit uses: a power law or a log-polynomial of the given order. */
+function gsmFitText({ order }) {
+  return order > 1 ? `log-polynomial spectrum (to ${order === 2 ? '2nd' : '3rd'} order)` : 'power law';
 }
 
 /** The epoch input as an ISO 8601 UTC string with seconds (datetime-local may omit them). */
@@ -475,7 +577,8 @@ function renderGsmNote() {
   const el = $('gsm-note');
   el.textContent =
     `≈ ${count.toLocaleString()} sources (pixel ≈ ${pixDeg.toFixed(2)}°) · maps at ${shown.map((f) => (f === null ? '…' : +(f / 1e6).toFixed(2))).join(', ')} MHz · ` +
-    'MJy/sr × pixel solid angle → Jy per source, power law fitted per pixel around the geometric-mean frequency. ' +
+    `MJy/sr × pixel solid angle → Jy per source, ${gsmFitText({ order: Math.max(1, Math.min(p.order, p.maps - 1)) })}` +
+    `${p.order >= p.maps && p.maps >= 2 ? ` (${p.maps} maps fit no higher order)` : ''} fitted per pixel around the geometric-mean frequency. ` +
     GSM_FRAME_NOTES[p.frame];
   let problem = null;
   if (!(p.maps >= 2)) problem = 'At least two maps are needed to fit a spectral index.';
@@ -507,7 +610,9 @@ async function generateGsm(append) {
     if (summary) {
       const [a1, a50, a99] = summary.alpha_percentiles || [];
       let msg = `GSM2016: ${summary.sources.toLocaleString()} sources (NSIDE ${summary.nside}, ${summary.frame}, ${summary.resolution} base maps) · ` +
-        `f_ref ${MHz(summary.reference_frequency)} · α median ${fmt(a50, 3)} (1–99%: ${fmt(a1, 3)} … ${fmt(a99, 3)}) · ` +
+        `f_ref ${MHz(summary.reference_frequency)} · ${summary.spectral_order > 1 ? 'α₁' : 'α'} median ${fmt(a50, 3)} (1–99%: ${fmt(a1, 3)} … ${fmt(a99, 3)}) · ` +
+        ['alpha2', 'alpha3'].filter((k) => (summary[`${k}_percentiles`] || []).length)
+          .map((k, j) => { const [lo, mid, hi] = summary[`${k}_percentiles`]; return `α${'₂₃'[j]} median ${fmt(mid, 3)} (${fmt(lo, 3)} … ${fmt(hi, 3)}) · `; }).join('') +
         `fit rms ${fmt(100 * summary.fit_rms_ln, 2)}% · total ${si(summary.total_flux_jy, 3, 'Jy')}`;
       if (summary.zenith_icrs_deg) {
         const [ra, dec] = summary.zenith_icrs_deg, [l, b] = summary.zenith_galactic_deg;
@@ -562,35 +667,102 @@ function refreshEnvironment() {
   $('sky-badge').textContent = `${state.sources.length} sources`;
   $('sky-origin').textContent = state.skyOrigin;
   $('sky-origin').hidden = !state.skyOrigin;
-  $('cal-badge').textContent = state.calibrator.enabled ? 'on' : 'off';
   $('array-caption').textContent = `${a.antenna_positions.length} antennas · ${si(stats.maxX - stats.minX, 3, 'm')} × ${si(stats.maxY - stats.minY, 3, 'm')}`;
-  $('sky-caption').textContent = `Colour and size ∝ ${$('apparent').checked ? 'apparent' : 'intrinsic'} intensity at ${MHz(state.viewFreq)}`;
+  $('sky-caption').textContent = `Colour and size ∝ ${$('apparent').checked ? 'apparent' : 'intrinsic'} flux density at ${MHz(state.viewFreq)}`;
 
   renderSourceList();
   renderGsmNote();
+  refreshDerived();
+  timelineEnvChanged();
+}
+
+let timeline = null;
+let outputs = null;
+let transmitter = null;
+const timelineEnvChanged = debounce(() => timeline && timeline.onEnvironmentChanged(), 400);
+
+/** Everything that depends on the environment and the timeline step, but not on its inputs. */
+function refreshDerived() {
+  const on = enabledCals();
+  $('cal-badge').textContent = on.length > 1 ? `${on.length} on` : on.length ? MODE_NAMES[on[0].mode] : 'off';
+  const skipped = timeline ? timeline.count() - timeline.runCount() : 0;
+  $('integrations-hint').textContent = skipped ? `(${skipped.toLocaleString()} skipped)` : '';
   refreshViewFreqDependent();
-  if (!err) renderModelSpectrum();
+  if (!validateArray(state.array)) renderModelSpectrum();
   renderParams();
   renderWorkload();
+  if (outputs) outputs.render();
+  updateRunLabel();
   updateStale();
 }
 
+/** Sources and calibrators the environment views show: those at the current timeline step. */
+function currentEnv() {
+  return (timeline && timeline.env()) || { sources: state.sources, calibrators: [], trajectories: [] };
+}
+
+/** Integrations the next run simulates (skipped ones excluded). */
+function integrationsCount() {
+  return timeline ? timeline.runCount() : (parseInt($('integrations').value, 10) || 1);
+}
+
+const hasCalibrator = () => enabledCals().length > 0;
+
+function updateRunLabel() {
+  const save = outputs && outputs.any();
+  $('run-btn').textContent = `▶ Run simulation${save ? ' & save' : ''}`;
+}
+
+/** Asks the user to pick one of `buttons` ({ label, value, primary }); resolves to its value, or '' if dismissed. */
+function ask(title, text, buttons) {
+  const dialog = $('choice-dialog');
+  $('choice-title').textContent = title;
+  $('choice-text').textContent = text;
+  $('choice-buttons').replaceChildren(...buttons.map((b) => Object.assign(document.createElement('button'), {
+    className: `btn${b.primary ? ' primary' : ''}`, value: b.value, textContent: b.label,
+  })));
+  dialog.returnValue = '';
+  dialog.showModal();
+  return new Promise((resolve) => dialog.addEventListener('close', () => resolve(dialog.returnValue), { once: true }));
+}
+
+function setIntegrations(n) {
+  $('integrations').value = n;
+  $('integrations').dispatchEvent(new Event('input'));
+}
+
+function throttle(fn, ms) {
+  let last = 0, timer = null;
+  return () => {
+    const wait = ms - (performance.now() - last);
+    if (wait <= 0) { last = performance.now(); fn(); return; }
+    clearTimeout(timer);
+    timer = setTimeout(() => { last = performance.now(); fn(); }, wait);
+  };
+}
+
+/** A new timeline step: views redraw immediately, the heavier model and table at most ~3×/s. */
+const stepModels = throttle(() => { renderModelSpectrum(); renderParams(); }, 300);
+function onTimelineStep() {
+  refreshViewFreqDependent({ beam: false });
+  stepModels();
+}
+
 /** Views that depend on the view frequency (cheap ones redraw immediately). */
-function refreshViewFreqDependent() {
+function refreshViewFreqDependent({ beam = true } = {}) {
   const env = {
     positions: state.array.antenna_positions,
-    sources: state.sources,
-    calibrator: state.calibrator,
+    ...currentEnv(),
     freq: state.viewFreq,
     cmap: state.cmap,
     scale: $('sky-scale').value,
   };
   scene.set(env);
-  arrayView.set({ positions: env.positions, calibrator: env.calibrator });
+  arrayView.set({ positions: env.positions, calibrators: env.calibrators });
   skyView.set({ ...env, apparent: $('apparent').checked });
   modelPlot.vlines = [{ x: state.viewFreq / 1e6, label: 'view' }];
   modelPlot.render();
-  requestBeam();
+  if (beam) requestBeam();
 }
 
 const requestBeam = debounce(async () => {
@@ -607,25 +779,44 @@ const requestBeam = debounce(async () => {
   } catch (e) { toast(`Beam: ${e.message}`, 'error'); }
 }, 150);
 
-function bandFreqs(array, n = 700) {
+/**
+ * Frequencies to evaluate the analytic model at: `n` across the first Nyquist zone, the band edges,
+ * and the analysis channels the calibrators' spectra occupy (so their lines are not missed).
+ */
+function bandFreqs(array, n = 700, shapesOrNull = []) {
   const lo = array.downmix_frequency, hi = array.downmix_frequency + array.sample_frequency / 2;
-  const f = new Float64Array(n);
-  for (let i = 0; i < n; i++) f[i] = lo + ((i + 0.5) / n) * (hi - lo);
+  const f = [];
+  for (let i = 0; i < n; i++) f.push(lo + ((i + 0.5) / n) * (hi - lo));
   // Make sure the band edges are sampled exactly so the model doesn't look clipped.
-  return Float64Array.from([...f, ...M.physicalBand(array)]).sort();
+  f.push(...M.physicalBand(array));
+  const shapes = [...new Set(shapesOrNull.filter(Boolean))];
+  for (const shape of shapes) {
+    const W = shape.values.length;
+    const lines = [];
+    for (let c = 0; c <= W / 2; c++) if (shape.values[c] > 0) lines.push(shape.fdm + c * shape.df);
+    const step = Math.ceil((lines.length * shapes.length) / 6000);
+    for (let i = 0; i < lines.length; i += step) f.push(lines[i]);
+  }
+  return Float64Array.from(new Set(f)).sort();
+}
+
+/** Model series of each calibrator in `cals`, labelled by name when there are several. */
+function calibratorSeries(cals, x, m) {
+  return cals.map((c, k) => ({ label: `${cals.length > 1 ? c.name : 'Calibrator'} (array mean)`, x, y: m.cals[k], color: c.color }));
 }
 
 function renderModelSpectrum() {
   const a = state.array;
-  const f = bandFreqs(a);
-  const m = M.modelSpectrum(a, state.sources, state.calibrator, f);
+  const env = currentEnv();
+  const f = bandFreqs(a, 700, env.calibrators.map((c) => c.shape));
+  const m = M.modelSpectrum(a, env.sources, env.calibrators, f);
   const x = Array.from(f, (v) => v / 1e6);
   const series = [
     { label: 'Total', x, y: m.total, color: 'fg', width: 2 },
     { label: 'Sky sources', x, y: m.sky, color: 's1' },
     { label: 'System noise', x, y: m.noise, color: 's2' },
+    ...calibratorSeries(env.calibrators, x, m),
   ];
-  if (state.calibrator.enabled) series.push({ label: 'Calibrator (array mean)', x, y: m.cal, color: 's3' });
   const [lo, hi] = M.physicalBand(a);
   modelPlot.opts.xDomain = [a.downmix_frequency / 1e6, (a.downmix_frequency + a.sample_frequency / 2) / 1e6];
   modelPlot.set(series, { bands: [{ x0: lo / 1e6, x1: hi / 1e6 }], vlines: [{ x: state.viewFreq / 1e6, label: 'view' }] });
@@ -638,8 +829,9 @@ function renderParams() {
   const fc = (lo + hi) / 2;
   const lamMin = M.C / hi, lamMax = M.C / lo, lamC = M.C / fc;
   const binsIn = Math.max(0, Math.floor((a.bandpass[1] * W) / fs) - Math.ceil((a.bandpass[0] * W) / fs) + 1);
-  const above = state.sources.filter((x) => x.z > 0).length;
-  const m = M.modelSpectrum(a, state.sources, state.calibrator, [state.viewFreq]);
+  const env = currentEnv();
+  const above = env.sources.filter((x) => x.z > 0).length;
+  const m = M.modelSpectrum(a, env.sources, env.calibrators, [state.viewFreq]);
   const aliasF = M.C / (2 * s.minSpacing);
   const alias = Number.isFinite(aliasF)
     ? (aliasF < hi ? [`above ${MHz(aliasF)}`, 'warn'] : ['none in band', 'ok'])
@@ -662,13 +854,13 @@ function renderParams() {
       ['Grating lobes (d > λ/2)', alias[0], alias[1]],
       ['Geometry', s.planar ? 'planar' : `non-planar (Δz ${si(s.maxZ - s.minZ, 3, 'm')})`],
     ]],
-    [`Sky at ${MHz(state.viewFreq)}`, [
-      ['Sources (above horizon)', `${state.sources.length} (${above})`],
-      ['Apparent sky power', fmt(m.sky[0], 4)],
-      ['System noise power', fmt(m.noise[0], 4)],
-      ['A_eff (noise)', `${fmt(M.effectiveAperture(state.viewFreq), 3)} m²`],
+    [`Sky at ${MHz(state.viewFreq)}${timeline && timeline.varies() ? ` · integration ${timeline.step() + 1}` : ''}`, [
+      ['Sources (above horizon)', `${env.sources.length} (${above})`],
+      ['Apparent sky (per bin)', `${fmt(m.sky[0], 4)} Jy`],
+      ['System noise (per bin)', `${fmt(m.noise[0], 4)} Jy`],
+      ['A_eff (noise)', `${fmt(M.effectiveAperture(state.viewFreq), 3)} m² · T_sys ${fmt(a.system_noise_intensity / M.K_B_JY, 3)} K`],
       ['Sky / noise', `${fmt(m.sky[0] / m.noise[0], 3)}`],
-      ...(state.calibrator.enabled ? calibratorRows(m) : []),
+      ...env.calibrators.flatMap((c, k) => (c.shape ? calibratorRows(m.cals[k][0], c, env.calibrators.length > 1) : [])),
     ]],
     ['Output', [
       ['Samples per window', (s.n * W).toLocaleString()],
@@ -680,27 +872,37 @@ function renderParams() {
     `<h4>${title}</h4><dl>${rows.map(([k, v, cls]) => `<dt>${k}</dt><dd class="${cls || ''}">${v}</dd>`).join('')}</dl>`).join('');
 }
 
-function calibratorRows(m) {
-  const c = state.calibrator, ctr = M.centroid(state.array.antenna_positions);
+/** Derived parameters of a calibrator `c` (with its shape) whose per-bin power at the view frequency is `perBin`. */
+function calibratorRows(perBin, c, named) {
+  const ctr = M.centroid(state.array.antenna_positions);
   const d = [c.position.x - ctr.x, c.position.y - ctr.y, c.position.z - ctr.z];
   const dist = Math.hypot(...d);
-  return [
-    ['Calibrator distance', si(dist, 4, 'm')],
-    ['Calibrator elevation', `${(Math.asin(d[2] / dist) * DEG).toFixed(1)}°`],
-    ['Calibrator power (mean)', `${fmt(m.cal[0], 4)}`],
+  const vr = (c.velocity.x * d[0] + c.velocity.y * d[1] + c.velocity.z * d[2]) / dist;
+  const who = named ? c.name : 'Calibrator';
+  const flux = M.meanCalibratorPower(c, state.array.antenna_positions);
+  const rows = [
+    [`${who} distance`, si(dist, 4, 'm')],
+    [`${who} elevation`, `${(Math.asin(d[2] / dist) * DEG).toFixed(1)}°${c.silent ? ' (off)' : ''}`],
+    [`${who} flux (mean)`, `${fmt(flux, 4)} W/m²`],
+    [`${who} (per bin)`, `${fmt(perBin, 4)} Jy`],
+    [`${who} peak (per bin)`, `${fmt(flux * c.shape.peak, 4)} Jy at ${MHz(c.shape.refFreq)}`],
   ];
+  const carrier = state.calibrators.find((k) => k.name === c.name)?.transmitter.frequency;
+  if (vr && carrier) rows.push([`Doppler shift (${named ? `${c.name} carrier` : 'carrier'})`, si((-carrier * vr) / M.C, 4, 'Hz')]);
+  return rows;
 }
 
 function workloadTerms() {
   const a = state.array;
   const R = +$('freq-res').value;
   const fine = Math.max(0, ((a.bandpass[1] - a.bandpass[0]) * a.sample_window_size * R) / a.sample_frequency);
-  return a.antenna_positions.length * (state.sources.length + 2) * fine;
+  const sources = timeline ? timeline.sourceCount() : state.sources.length;
+  return a.antenna_positions.length * (sources + 2) * fine;
 }
 
 function renderWorkload() {
   const terms = workloadTerms();
-  const n = parseInt($('integrations').value, 10) || 1;
+  const n = integrationsCount();
   const rate = state.rates[state.runtime];
   let text = `≈ ${si(terms, 3)} source·bin terms per window`;
   if (rate) {
@@ -721,7 +923,8 @@ function isActive() {
   return s === 'running' || s === 'initializing';
 }
 
-function buildRequest() {
+/** Request for a plain run; with `key`, the transmit buffer is replaced by its identity. */
+function buildRequest({ key = false } = {}) {
   let seed = $('seed').value.trim();
   const rng_seed = seed === '' ? Math.floor(Math.random() * 2 ** 32) : Number(seed);
   return {
@@ -730,36 +933,73 @@ function buildRequest() {
     rng_seed,
     integrations: parseInt($('integrations').value, 10),
     array: state.array,
-    sources: state.sources.map((s) => ({
-      right_ascension: s.ra, declination: s.dec, reference_frequency: s.f0, reference_intensity: s.I0, spectral_index: s.alpha,
+    sources: state.sources.map(M.sourceDto),
+    // Kinematic calibrators; series ones only run through the pipeline (timeline.requestPart).
+    calibrators: state.calibrators.filter((c) => c.mode === 'fixed').map((c) => ({
+      name: c.name, position: c.position, velocity: c.velocity, acceleration: c.acceleration,
+      transmitter: transmitter.dto(c, c.transmitter.power, { key }),
     })),
-    calibrator: state.calibrator.enabled ? { position: state.calibrator.position, intensity: state.calibrator.intensity } : null,
     analysis: { window: $('window-fn').value, channels: parseInt($('channels').value, 10) },
   };
 }
 
+/**
+ * Request for the timeline/output path: per-integration times, calibrator positions and sky
+ * frames, and the data products to save.
+ */
+function buildPipelineRequest() {
+  const base = buildRequest();
+  return {
+    runtime: base.runtime, frequency_resolution: base.frequency_resolution, rng_seed: base.rng_seed,
+    array: base.array, analysis: base.analysis, products: outputs.products(), output_name: outputs.name(),
+    ...timeline.requestPart(),
+  };
+}
+
+/** Runs that vary over the timeline or save products go through the pipeline. */
+const viaPipeline = () => timeline.needsPipeline() || outputs.any();
+
 /** Identity of the configuration that affects results (seed excluded when random). */
 function configKey() {
-  const r = buildRequest();
-  if ($('seed').value.trim() === '') r.rng_seed = 'random';
-  return JSON.stringify(r);
+  try {
+    const r = buildRequest({ key: true });
+    if ($('seed').value.trim() === '') r.rng_seed = 'random';
+    if (timeline.needsPipeline()) {
+      r.timeline = timeline.requestPart({ key: true });
+      delete r.integrations;
+      delete r.calibrators;
+      delete r.sources;
+    }
+    return JSON.stringify(r);
+  } catch {
+    return null;
+  }
 }
 
 async function startRun() {
-  const request = buildRequest();
+  const pipeline = viaPipeline();
+  let request;
   try {
-    const { run_id } = await api('/run', {
+    request = pipeline ? buildPipelineRequest() : buildRequest();
+  } catch (e) {
+    toast(`Cannot run: ${e.message}`, 'error');
+    return;
+  }
+  try {
+    const { run_id } = await api(pipeline ? '/pipeline/run' : '/run', {
       method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(request),
     });
     state.activeRunId = run_id;
+    // The Signals/Imaging tabs compare against this: the sky at the middle integration, without
+    // moving calibrators.
     state.pendingSnapshot = {
       key: configKey(),
-      sources: state.sources.slice(),
-      calibrator: structuredClone(state.calibrator),
+      sources: timeline.snapshotSources(),
+      calibrators: timeline.snapshotCalibrators(),
       terms: workloadTerms(),
       runtime: state.runtime,
     };
-    setStatus({ state: 'initializing', completed: 0, total: request.integrations, elapsed_s: 0 });
+    setStatus({ state: 'initializing', kind: pipeline ? 'pipeline' : 'simulation', completed: 0, total: integrationsCount(), elapsed_s: 0 });
     pollStatus();
   } catch (e) {
     toast(`Could not start simulation: ${e.message}`, 'error');
@@ -775,9 +1015,9 @@ function setStatus(s) {
   const text = {
     idle: 'Idle',
     initializing: `Initialising ${state.runtime.toUpperCase()} runtime…`,
-    running: `Simulating · window ${s.completed}/${s.total} · ${elapsed}`,
-    finished: `Finished · ${s.completed} windows in ${elapsed}`,
-    cancelled: `Cancelled after ${s.completed}/${s.total} windows`,
+    running: `Simulating · integration ${s.completed}/${s.total} · ${elapsed}`,
+    finished: `Finished · ${s.completed} integrations in ${elapsed}`,
+    cancelled: `Cancelled after ${s.completed}/${s.total} integrations`,
     failed: `Failed: ${s.message || 'unknown error'}`,
   }[s.state];
   $('status-text').textContent = text;
@@ -796,7 +1036,8 @@ async function pollStatus() {
   if ((s.state === 'finished' || s.state === 'cancelled') && s.completed > 0) {
     if (state.pendingSnapshot) { state.snapshot = state.pendingSnapshot; state.pendingSnapshot = null; }
     await loadResults();
-    toast(`Simulation ${s.state} — ${s.completed} windows. See Signals and Imaging.`, 'ok');
+    const saved = s.kind === 'pipeline' ? await outputs.onJobFinished() : null;
+    if (!saved || !saved.file) toast(`Simulation ${s.state} — ${s.completed} integrations. See Signals and Imaging.`, 'ok');
   }
 }
 
@@ -836,7 +1077,11 @@ function updateStale() {
 // Signals
 
 function runSources() { return state.snapshot ? state.snapshot.sources : state.sources; }
-function runCalibrator() { return state.snapshot ? state.snapshot.calibrator : state.calibrator; }
+/** Calibrators of the latest run for the analytic model (static ones, with their spectral shapes). */
+function runCalibrators() {
+  if (!state.run || !state.run.calibrators) return [];
+  return state.snapshot ? state.snapshot.calibrators : timeline.snapshotCalibrators();
+}
 
 function renderRunTiles() {
   const r = state.run;
@@ -849,7 +1094,7 @@ function renderRunTiles() {
     ['Throughput', `${si(samples / perWindow, 3, 'S')}/s`, `${si(r.array.sample_frequency * r.antennas, 3, 'S')}/s real-time`],
     realtimeTile((r.array.sample_window_size / r.array.sample_frequency) / perWindow),
     ['Simulated data', si(samples * 8 * r.integrations, 3, 'B'), `${r.antennas} antennas × ${r.array.sample_window_size} × ${r.integrations}`],
-    ['Total time', si(r.timing.total_s, 3, 's'), `${r.sources} sources${r.calibrator ? ' + calibrator' : ''}`],
+    ['Total time', si(r.timing.total_s, 3, 's'), `${r.sources} sources${r.calibrators ? ` + ${r.calibrators} calibrator${r.calibrators > 1 ? 's' : ''}` : ''}`],
   ]);
 }
 
@@ -862,7 +1107,7 @@ function realtimeTile(ratio) {
 function renderPowerMap() {
   const r = state.run;
   powerMap.set({
-    positions: r.array.antenna_positions, calibrator: runCalibrator(), values: r.antenna_power, selected: state.antenna, cmap: state.cmap,
+    positions: r.array.antenna_positions, calibrators: runCalibrators(), values: r.antenna_power, selected: state.antenna, cmap: state.cmap,
   });
 }
 
@@ -908,11 +1153,11 @@ function renderSpectrum() {
   const x = spectrumAxis(r);
   const a = r.array;
   // Analytic model for this antenna (calibrator power depends on its position).
-  const f = bandFreqs(a, 400);
-  const sources = runSources(), cal = runCalibrator();
-  const m = M.modelSpectrum(a, sources, { enabled: false }, f);
-  const calP = cal && cal.enabled && r.calibrator ? M.calibratorPower(cal, d.position) : 0;
-  const model = Array.from(m.total, (v) => v + calP);
+  const sources = runSources(), cals = runCalibrators().filter((c) => c.shape);
+  const f = bandFreqs(a, 400, cals.map((c) => c.shape));
+  const m = M.modelSpectrum(a, sources, [], f);
+  const calP = cals.map((c) => M.calibratorPower(c, d.position));
+  const model = Array.from(m.total, (v, k) => cals.reduce((sum, c, j) => sum + calP[j] * c.shape.at(f[k]), v));
   const series = [
     { label: `Antenna ${d.index}`, x, y: d.spectrum, color: 's1', width: 1.2 },
     { label: 'Array mean', x, y: r.mean_spectrum, color: 's2', width: 1.2 },
@@ -928,7 +1173,7 @@ function renderSpectrum() {
   let meas = 0, mod = 0, n = 0;
   for (let i = i0; i <= i1; i++) { meas += r.mean_spectrum[i]; n++; }
   meas /= n;
-  const mf = M.modelSpectrum(a, sources, cal && r.calibrator ? cal : { enabled: false }, x.slice(i0, i1 + 1).map((v) => v * 1e6));
+  const mf = M.modelSpectrum(a, sources, cals, x.slice(i0, i1 + 1).map((v) => v * 1e6));
   mod = mf.total.reduce((s, v) => s + (Number.isFinite(v) ? v : 0), 0) / mf.total.filter(Number.isFinite).length;
   $('spec-caption').textContent = `Mean over ${r.integrations} integration${r.integrations > 1 ? 's' : ''} · in-band array mean / model = ${fmt(meas / mod, 4)}`;
 }
@@ -1003,15 +1248,19 @@ function drawImageOverlay(ctx, toPx, t) {
     }
     ctx.globalAlpha = 1;
   }
-  const cal = runCalibrator();
-  if (cal && cal.enabled && state.run.calibrator) {
-    const c = M.centroid(state.run.array.antenna_positions);
+  const cals = runCalibrators();
+  const c = M.centroid(state.run.array.antenna_positions);
+  for (const cal of cals) {
     const d = [cal.position.x - c.x, cal.position.y - c.y, cal.position.z - c.z];
     const n = Math.hypot(...d);
     if (d[2] > 0) {
       const [x, y] = toPx(d[0] / n, d[1] / n);
-      ctx.strokeStyle = t.s3; ctx.lineWidth = 2;
+      ctx.strokeStyle = t[cal.color] || t.s3; ctx.lineWidth = 2;
       ctx.beginPath(); ctx.moveTo(x, y - 8); ctx.lineTo(x + 7, y); ctx.lineTo(x, y + 8); ctx.lineTo(x - 7, y); ctx.closePath(); ctx.stroke();
+      if (cal.named) {
+        ctx.fillStyle = '#ffffff'; ctx.font = t.font; ctx.textAlign = 'left'; ctx.textBaseline = 'middle';
+        ctx.fillText(cal.name, x + 10, y);
+      }
     }
   }
 }
@@ -1029,16 +1278,16 @@ async function loadImage() {
 
   const { xs, ys } = relativeXY(r.array.antenna_positions);
   const noisePower = r.array.system_noise_intensity / M.effectiveAperture(freq);
-  const sources = runSources().map(({ x, y, z, f0, I0, alpha }) => ({ x, y, z, f0, I0, alpha }));
-  // The calibrator enters as a far-field point source in its direction from the array centre,
+  const sources = runSources().map(({ x, y, z, f0, I0, alpha, alpha2, alpha3 }) => ({ x, y, z, f0, I0, alpha, alpha2, alpha3 }));
+  // Calibrators enter as far-field point sources in their directions from the array centre,
   // carrying the mean per-antenna power (exact for distant emitters such as satellites).
-  const cal = runCalibrator();
-  if (cal && cal.enabled && r.calibrator) {
-    const c = M.centroid(r.array.antenna_positions);
+  const c = M.centroid(r.array.antenna_positions);
+  for (const cal of runCalibrators()) {
+    if (!cal.shape) continue;
     const d = [cal.position.x - c.x, cal.position.y - c.y, cal.position.z - c.z];
     const n = Math.hypot(...d);
     const z = d[2] / n;
-    const power = M.meanCalibratorPower(cal, r.array.antenna_positions);
+    const power = M.meanCalibratorPower(cal, r.array.antenna_positions) * cal.shape.at(freq);
     if (z > 0 && power > 0) sources.push({ x: d[0] / n, y: d[1] / n, z, f0: freq, I0: power / (z * z), alpha: 0 });
   }
 
@@ -1112,7 +1361,9 @@ function currentTab() { return document.querySelector('.tabs .on').dataset.tab; 
 function showTab(name) {
   document.querySelectorAll('.tabs button').forEach((b) => b.classList.toggle('on', b.dataset.tab === name));
   document.querySelectorAll('.tab-panel').forEach((p) => { p.hidden = p.id !== `tab-${name}`; });
-  if (name !== 'environment') $(`${name}-dot`).hidden = true;
+  const dot = $(`${name}-dot`);
+  if (dot) dot.hidden = true;
+  if (name === 'outputs' && outputs) outputs.loadFiles();
   try { localStorage.setItem('fringe.tab', name); } catch { /* storage unavailable */ }
 }
 
@@ -1121,6 +1372,53 @@ function applyTheme(theme) {
   else delete document.documentElement.dataset.theme;
   allViews.forEach((v) => v.render());
   [modelPlot, tsPlot, specPlot, histPlot].forEach((p) => p.renderLegend());
+}
+
+/** Sidebar width: drag the handle (or use arrow keys on it), double-click to reset; remembered. */
+function initSidebarResize() {
+  const layout = document.querySelector('.layout'), handle = $('sidebar-resizer');
+  const DEFAULT = 320, MIN = 260;
+  const max = () => Math.max(MIN, Math.min(720, window.innerWidth * 0.6));
+  const clamp = (w) => Math.round(Math.min(max(), Math.max(MIN, w)));
+  let width = DEFAULT;
+  const set = (w, save = true) => {
+    width = clamp(w);
+    layout.style.setProperty('--sidebar-w', `${width}px`);
+    handle.setAttribute('aria-valuenow', width);
+    if (save) try { localStorage.setItem('fringe.sidebar', width); } catch { /* storage unavailable */ }
+  };
+  try { set(parseFloat(localStorage.getItem('fringe.sidebar')) || DEFAULT, false); } catch { set(DEFAULT, false); }
+  handle.setAttribute('aria-valuemin', MIN);
+
+  handle.addEventListener('pointerdown', (e) => {
+    if (e.button !== 0) return;
+    e.preventDefault();
+    handle.setPointerCapture(e.pointerId);
+    const x0 = e.clientX, w0 = width;
+    handle.classList.add('dragging');
+    document.body.classList.add('resizing-sidebar');
+    const move = (ev) => set(w0 + ev.clientX - x0, false);
+    const up = () => {
+      handle.removeEventListener('pointermove', move);
+      handle.classList.remove('dragging');
+      document.body.classList.remove('resizing-sidebar');
+      set(width);
+    };
+    handle.addEventListener('pointermove', move);
+    handle.addEventListener('pointerup', up, { once: true });
+    handle.addEventListener('pointercancel', up, { once: true });
+  });
+  handle.addEventListener('dblclick', () => set(DEFAULT));
+  handle.addEventListener('keydown', (e) => {
+    const step = e.shiftKey ? 64 : 16;
+    if (e.key === 'ArrowLeft') set(width - step);
+    else if (e.key === 'ArrowRight') set(width + step);
+    else if (e.key === 'Home') set(MIN);
+    else if (e.key === 'End') set(max());
+    else return;
+    e.preventDefault();
+  });
+  window.addEventListener('resize', () => { if (width > max()) set(width, false); });
 }
 
 function bind() {
@@ -1139,8 +1437,8 @@ function bind() {
     document.querySelectorAll('#runtime button').forEach((x) => x.classList.toggle('on', x === b));
     renderWorkload(); updateStale();
   }));
-  for (const id of ['freq-res', 'integrations', 'seed', 'window-fn', 'channels']) {
-    $(id).addEventListener('input', () => { renderParams(); renderWorkload(); updateStale(); });
+  for (const id of ['freq-res', 'seed', 'window-fn', 'channels']) {
+    $(id).addEventListener('input', () => { renderParams(); renderWorkload(); outputs.render(); updateStale(); });
   }
   $('run-btn').addEventListener('click', startRun);
   $('cancel-btn').addEventListener('click', () => api('/run/cancel', { method: 'POST' }).catch((e) => toast(e.message, 'error')));
@@ -1153,7 +1451,8 @@ function bind() {
   });
   $('array-export').addEventListener('click', () => download('array.json', M.serializeArray(state.array), 'application/json'));
   $('gen-layout').addEventListener('change', renderGenParams);
-  $('array-python').addEventListener('click', openPythonDialog);
+  $('array-python').addEventListener('click', () => openPythonDialog('layout'));
+  $('series-python').addEventListener('click', () => openPythonDialog('calibrator'));
   $('gen-array').addEventListener('click', generateArray);
 
   // Sky
@@ -1174,30 +1473,70 @@ function bind() {
   };
   $('sky-generate').addEventListener('click', () => genSky(false));
   $('sky-append').addEventListener('click', () => genSky(true));
-  for (const id of ['gsm-nside', 'gsm-maps', 'gsm-frame', 'gsm-epoch', 'gsm-fmin', 'gsm-fmax', 'gsm-resolution', 'gsm-horizon']) {
+  for (const id of ['gsm-nside', 'gsm-maps', 'gsm-order', 'gsm-frame', 'gsm-epoch', 'gsm-fmin', 'gsm-fmax', 'gsm-resolution', 'gsm-horizon']) {
     $(id).addEventListener('input', renderGsmNote);
   }
   $('gsm-replace').addEventListener('click', () => generateGsm(false));
   $('gsm-append').addEventListener('click', () => generateGsm(true));
   $('src-add').addEventListener('click', () => {
     const v = (id) => parseFloat($(id).value);
-    if (!(v('src-f0') > 0) || !(v('src-i') >= 0)) return toast('Source needs f₀ > 0 and I₀ ≥ 0', 'error');
-    setSky(state.sources.concat([M.makeSource(v('src-ra') / DEG, v('src-dec') / DEG, v('src-f0') * 1e6, v('src-i'), v('src-alpha') || 0)]), editedOrigin());
+    if (!(v('src-f0') > 0) || !(v('src-i') >= 0)) return toast('Source needs f₀ > 0 and S₀ ≥ 0', 'error');
+    setSky(state.sources.concat([M.makeSource(v('src-ra') / DEG, v('src-dec') / DEG, v('src-f0') * 1e6, v('src-i'), v('src-alpha') || 0, v('src-alpha2') || 0, v('src-alpha3') || 0)]), editedOrigin());
   });
 
   // Calibrator
-  for (const id of ['cal-enabled', 'cal-x', 'cal-y', 'cal-z', 'cal-i']) $(id).addEventListener('input', readCalibratorInputs);
+  document.querySelectorAll('#cal-mode button').forEach((b) => b.addEventListener('click', () => setCalMode(b.dataset.value)));
+  for (const [, prefix] of KINEMATICS) for (const axis of 'xyz') $(`${prefix}${axis}`).addEventListener('input', readCalibratorInputs);
   document.querySelectorAll('[data-cal-preset]').forEach((b) => b.addEventListener('click', () => setCalibratorPreset(b.dataset.calPreset)));
   $('cal-file').addEventListener('change', async (e) => {
-    try { state.calibrator = M.parseCalibratorJson(await readFile(e.target)); writeCalibratorInputs(); envChanged(); toast('Calibrator loaded'); } catch (err) { toast(`Calibrator file: ${err.message}`, 'error'); }
+    try {
+      const loaded = await readFringeCalibrators([...e.target.files]);
+      // The first replaces the selected calibrator, the others go after it.
+      const cals = loaded.map((l, k) => {
+        const cal = k ? newCalibrator() : activeCal();
+        // fringe gives the state at its epoch; move it to the start of the timeline (t = 0).
+        const { position: p, velocity: v, acceleration: a } = l.calibrator, t = -l.epoch;
+        cal.position = { x: p.x + v.x * t + 0.5 * a.x * t * t, y: p.y + v.y * t + 0.5 * a.y * t * t, z: p.z + v.z * t + 0.5 * a.z * t * t };
+        cal.velocity = { x: v.x + a.x * t, y: v.y + a.y * t, z: v.z + a.z * t };
+        cal.acceleration = a;
+        cal.mode = 'fixed';
+        transmitter.adopt(cal.transmitter, l.transmitter, l.buffer, l.bufferName);
+        return cal;
+      });
+      state.calibrators.splice(state.activeCal + 1, 0, ...cals.slice(1));
+      renumberCalibrators();
+      setCalMode('fixed');
+      toast(loaded.length > 1 ? `${loaded.length} calibrators loaded as ${cals[0].name} – ${cals[cals.length - 1].name}` : `Calibrator loaded as ${cals[0].name}`, 'ok');
+    } catch (err) {
+      toast(`Calibrator file: ${err.message}`, 'error');
+    } finally {
+      e.target.value = '';
+    }
   });
-  $('cal-export').addEventListener('click', () => download('calibrator.json', M.serializeCalibrator(state.calibrator), 'application/json'));
+  $('cal-export').addEventListener('click', () => {
+    const cals = state.calibrators.filter((c) => c.mode === 'fixed');
+    if (!cals.length) return toast('Only kinematic calibrators can be exported, and none is on', 'error');
+    const missing = cals.find((c) => !c.transmitter.buffer);
+    if (missing) return toast(`${missing.name}'s transmitter has no buffer yet`, 'error');
+    // Calibrators sharing a buffer share its file.
+    const files = new Map();
+    for (const c of cals) if (!files.has(c.transmitter.buffer)) files.set(c.transmitter.buffer, `calibrators.${files.size}.cf32`);
+    download('calibrators.json', fringeCalibratorJson(cals, cals.map((c) => files.get(c.transmitter.buffer))), 'application/json');
+    [...files].forEach(([buffer, name], k) => setTimeout(() => download(name, serializeCf32(buffer), 'application/octet-stream'), 300 * (k + 1)));
+    const series = state.calibrators.filter((c) => c.mode === 'series').length;
+    if (series) toast(`Exported the kinematic calibrators; ${series} series calibrator${series > 1 ? 's have' : ' has'} no fringe JSON form (use Series → Export)`);
+  });
+  $('cal-remove').addEventListener('click', removeCalibrator);
+  $('tx-auto').addEventListener('click', async () => {
+    await timeline.refresh();
+    if (!timeline.autoPower(activeCal())) toast(`Nothing to scale: ${activeCal().name} has no position above the horizon, or its spectrum misses the band`, 'error');
+  });
 
   // Environment toolbar
   $('view-freq').addEventListener('input', () => {
     viewFreqFromSlider();
     refreshViewFreqDependent();
-    $('sky-caption').textContent = `Colour and size ∝ ${$('apparent').checked ? 'apparent' : 'intrinsic'} intensity at ${MHz(state.viewFreq)}`;
+    $('sky-caption').textContent = `Colour and size ∝ ${$('apparent').checked ? 'apparent' : 'intrinsic'} flux density at ${MHz(state.viewFreq)}`;
     debouncedFreqText();
   });
   $('env-cmap').addEventListener('change', (e) => {
@@ -1244,17 +1583,48 @@ async function init() {
   } catch { /* storage unavailable */ }
 
   populateSelects();
+  // Canvases draw text with the theme's web fonts; wait briefly for them (fallbacks offline).
+  const fonts = ['400 12px "IBM Plex Sans"', '400 12px "IBM Plex Mono"', '700 14px "Space Grotesk"'];
+  try {
+    await Promise.race([Promise.all(fonts.map((f) => document.fonts.load(f))), new Promise((r) => setTimeout(r, 1500))]);
+  } catch { /* font loading API unavailable */ }
   $('env-cmap').value = state.cmap;
-  $('img-cmap').value = 'plasma';
+  $('img-cmap').value = state.cmap;
+  initSidebarResize();
   bind();
+  renumberCalibrators();
+  transmitter = initTransmitter({
+    state, api, toast, download,
+    views: allViews,
+    active: activeCal,
+    openPython: (kind) => openPythonDialog(kind),
+    onChange: () => { if (timeline) timeline.refresh(); updateStale(); },
+  });
+  timeline = initTimeline({
+    state, api, toast, download, ask, setIntegrations, transmitter,
+    active: activeCal,
+    views: allViews,
+    onStep: onTimelineStep,
+    onChange: refreshDerived,
+  });
+  outputs = initOutputs({
+    state, api, toast,
+    views: allViews,
+    integrations: integrationsCount,
+    hasCalibrator,
+    calibratorCount: () => enabledCals().length,
+    onChange: updateRunLabel,
+  });
   writeArrayInputs();
-  writeCalibratorInputs();
+  renderCalibratorPanel();
 
   let info = null;
   try { info = await api('/info'); } catch (e) { toast(`Server unavailable: ${e.message}`, 'error'); }
   state.gsmAvailable = !!(info && info.gsm);
-  state.pythonLayout = !!(info && info.python_layout);
-  state.pythonLayoutDisabled = info ? info.python_layout_disabled : 'The server is unavailable.';
+  state.python = !!(info && info.python_code);
+  state.pythonDisabled = !info ? 'The server is unavailable.'
+    : !('python_code' in info) ? 'The running server is older than this page; restart it (cargo run --release).'
+      : info.python_code_disabled;
   $('gsm-unavailable').hidden = state.gsmAvailable;
   $('gsm-unavailable').textContent = 'The server could not find pygdsm, healpy and astropy. Install them (pip install pygdsm) or start the server with --python pointing at an interpreter that has them.';
   try {
@@ -1277,6 +1647,8 @@ async function init() {
     if (s.state === 'running' || s.state === 'initializing') pollStatus();
     else if (s.state === 'finished' || s.state === 'cancelled') await loadResults();
   } catch { /* server unavailable; already reported */ }
+  outputs.onJobFinished({ quiet: true });
+  outputs.loadFiles();
 }
 
 init();

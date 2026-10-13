@@ -1,8 +1,9 @@
 //! Derived data products computed from fringe's time-domain antenna samples.
 //!
-//! Power spectra are normalised so that, for a stationary signal, the expected value of a
-//! bin equals the per-bin intensity fringe synthesises (`gain * I(f)` for sources,
-//! `noise / A_eff(f)` for system noise). This lets the frontend overlay the analytic model.
+//! fringe's samples are in √Jy. Power spectra are normalised so that, for a stationary signal,
+//! the expected value of a bin equals the flux density (Jy) fringe synthesises in it
+//! (`gain * S(f)` for sources, `k_B T_sys / A_eff(f)` for system noise, and a calibrator's flux
+//! density spread over its spectrum). This lets the frontend overlay the analytic model.
 
 use std::collections::HashMap;
 use std::f64::consts::TAU;
@@ -83,7 +84,7 @@ pub struct RunSummary {
     pub integrations: usize,
     pub antennas: usize,
     pub sources: usize,
-    pub calibrator: bool,
+    pub calibrators: usize,
     pub window: WindowFunction,
     pub array: ArrayDto,
     pub timing: Timing,
@@ -315,7 +316,7 @@ impl Accumulator {
                 integrations: self.integrations,
                 antennas: n_ant,
                 sources: req.sources.len(),
-                calibrator: req.calibrator.is_some(),
+                calibrators: req.calibrators.len(),
                 window: req.analysis.window,
                 array: req.array_dto.clone(),
                 timing: Timing {
@@ -358,7 +359,7 @@ impl RunResult {
     ///
     /// fringe gives antenna `a` a source phase of `+2π f (d·r_a) / c`, so the beam steered to
     /// direction `d = (l, m, n)` is `|Σ_a E_a exp(-2πi f (d·r_a) / c)|²`. Normalised by
-    /// `antennas²`, a point source then peaks at its apparent intensity `gain · I(f)`.
+    /// `antennas²`, a point source then peaks at its apparent flux density `gain · S(f)` (Jy).
     pub fn image(&self, channel: usize, size: usize) -> Option<Arc<Image>> {
         let info = self.summary.channels.get(channel)?;
         if let Some(image) = self.images.lock().unwrap().get(&(channel, size)) {
@@ -368,77 +369,13 @@ impl RunResult {
         let started = std::time::Instant::now();
         let n_ant = self.positions.len();
         let n_chan = self.summary.channels.len();
-        let n_int = self.summary.integrations;
-        let k = TAU * info.frequency / C;
-
-        let centroid = self
-            .positions
-            .iter()
-            .fold(Vec3::new(0.0, 0.0, 0.0), |acc, p| acc + *p)
-            / n_ant as f64;
-        let rel: Vec<Vec3> = self.positions.iter().map(|p| *p - centroid).collect();
-        let planar = rel.iter().all(|p| p.z.abs() < 1e-9);
-
-        let coord = |i: usize| -1.0 + (i as f64 + 0.5) * 2.0 / size as f64;
-        let phasors = |component: fn(&Vec3) -> f64| -> Vec<Complex32> {
-            (0..size)
-                .flat_map(|i| {
-                    let u = coord(i);
-                    rel.iter().map(move |p| {
-                        let phase = -k * u * component(p);
-                        Complex32::new(phase.cos() as f32, phase.sin() as f32)
-                    })
-                })
-                .collect()
-        };
-        let wl = phasors(|p| p.x);
-        let wm = phasors(|p| p.y);
-
-        let norm = 1.0 / (n_int as f32 * (n_ant * n_ant) as f32);
-        let data: Vec<f32> = (0..size)
-            .into_par_iter()
-            .flat_map_iter(|j| {
-                let m = coord(j);
-                let wm_row = &wm[j * n_ant..(j + 1) * n_ant];
-                let mut row = vec![0.0f32; size];
-                let mut steered = vec![Complex32::new(0.0, 0.0); n_ant];
-                for n in 0..n_int {
-                    let offset = (n * n_chan + channel) * n_ant;
-                    let e_field = &self.channel_store[offset..offset + n_ant];
-                    for ((s, e), w) in steered.iter_mut().zip(e_field).zip(wm_row) {
-                        *s = e * w;
-                    }
-                    for (i, value) in row.iter_mut().enumerate() {
-                        let l = coord(i);
-                        let r2 = l * l + m * m;
-                        if r2 > 1.0 {
-                            continue;
-                        }
-                        let wl_row = &wl[i * n_ant..(i + 1) * n_ant];
-                        let sum = if planar {
-                            steered
-                                .iter()
-                                .zip(wl_row)
-                                .fold(Complex32::new(0.0, 0.0), |acc, (s, w)| acc + s * w)
-                        } else {
-                            let nz = (1.0 - r2).sqrt();
-                            steered.iter().zip(wl_row).zip(&rel).fold(
-                                Complex32::new(0.0, 0.0),
-                                |acc, ((s, w), p)| {
-                                    let phase = (-k * nz * p.z) as f32;
-                                    acc + s * w * Complex32::from_polar(1.0, phase)
-                                },
-                            )
-                        };
-                        *value += sum.norm_sqr();
-                    }
-                }
-                row.into_iter().enumerate().map(move |(i, v)| {
-                    let l = coord(i);
-                    if l * l + m * m > 1.0 { f32::NAN } else { v * norm }
-                })
+        let fields: Vec<&[Complex32]> = (0..self.summary.integrations)
+            .map(|n| {
+                let offset = (n * n_chan + channel) * n_ant;
+                &self.channel_store[offset..offset + n_ant]
             })
             .collect();
+        let data = beamform(&self.positions, &[(info.frequency, fields)], size);
 
         let (min, max) = data
             .iter()
@@ -461,4 +398,78 @@ impl RunResult {
             .insert((channel, size), image.clone());
         Some(image)
     }
+}
+
+/// Dirty image on a `size × size` grid of direction cosines (l, m) ∈ [-1, 1]², row 0 at m = -1,
+/// `NaN` below the horizon.
+///
+/// `groups` pairs a physical frequency with the antenna E-fields (one value per antenna) measured
+/// at it; the beam powers of all fields are averaged incoherently. fringe gives antenna `a` a
+/// source phase of `+2π f (d·r_a) / c`, so the beam steered to `d = (l, m, n)` is
+/// `|Σ_a E_a exp(-2πi f (d·r_a) / c)|²`. Normalised by `antennas²`, a point source peaks at its
+/// apparent flux density `gain · S(f)` (Jy).
+pub fn beamform(positions: &[Vec3], groups: &[(f64, Vec<&[Complex32]>)], size: usize) -> Vec<f32> {
+    let n_ant = positions.len();
+    let centroid = positions.iter().fold(Vec3::new(0.0, 0.0, 0.0), |acc, p| acc + *p) / n_ant as f64;
+    let rel: Vec<Vec3> = positions.iter().map(|p| *p - centroid).collect();
+    let planar = rel.iter().all(|p| p.z.abs() < 1e-9);
+    let coord = |i: usize| -1.0 + (i as f64 + 0.5) * 2.0 / size as f64;
+    let total: usize = groups.iter().map(|(_, fields)| fields.len()).sum();
+    let mut image = vec![0.0f32; size * size];
+
+    for (frequency, fields) in groups {
+        let k = TAU * frequency / C;
+        let phasors = |component: fn(&Vec3) -> f64| -> Vec<Complex32> {
+            (0..size)
+                .flat_map(|i| {
+                    let u = coord(i);
+                    rel.iter().map(move |p| {
+                        let phase = -k * u * component(p);
+                        Complex32::new(phase.cos() as f32, phase.sin() as f32)
+                    })
+                })
+                .collect()
+        };
+        let wl = phasors(|p| p.x);
+        let wm = phasors(|p| p.y);
+
+        image.par_chunks_mut(size).enumerate().for_each(|(j, row)| {
+            let m = coord(j);
+            let wm_row = &wm[j * n_ant..(j + 1) * n_ant];
+            let mut steered = vec![Complex32::new(0.0, 0.0); n_ant];
+            for e_field in fields {
+                for ((s, e), w) in steered.iter_mut().zip(e_field.iter()).zip(wm_row) {
+                    *s = e * w;
+                }
+                for (i, value) in row.iter_mut().enumerate() {
+                    let l = coord(i);
+                    let r2 = l * l + m * m;
+                    if r2 > 1.0 {
+                        continue;
+                    }
+                    let wl_row = &wl[i * n_ant..(i + 1) * n_ant];
+                    let sum = if planar {
+                        steered.iter().zip(wl_row).fold(Complex32::new(0.0, 0.0), |acc, (s, w)| acc + s * w)
+                    } else {
+                        let nz = (1.0 - r2).sqrt();
+                        steered.iter().zip(wl_row).zip(&rel).fold(
+                            Complex32::new(0.0, 0.0),
+                            |acc, ((s, w), p)| acc + s * w * Complex32::from_polar(1.0, (-k * nz * p.z) as f32),
+                        )
+                    };
+                    *value += sum.norm_sqr();
+                }
+            }
+        });
+    }
+
+    let norm = 1.0 / (total.max(1) as f32 * (n_ant * n_ant) as f32);
+    for (j, row) in image.chunks_mut(size).enumerate() {
+        let m = coord(j);
+        for (i, v) in row.iter_mut().enumerate() {
+            let l = coord(i);
+            *v = if l * l + m * m > 1.0 { f32::NAN } else { *v * norm };
+        }
+    }
+    image
 }

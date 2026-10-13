@@ -14,8 +14,10 @@ export function theme() {
     s2: css('--series-2'),
     s3: css('--series-3'),
     s4: css('--series-4'),
+    s5: css('--series-5'),
+    s6: css('--series-6'),
     hl: css('--highlight'),
-    font: '11px ' + css('--font-ui'),
+    font: '11px ' + css('--font-chart'),
     mono: '11px ' + css('--font-mono'),
   };
 }
@@ -561,8 +563,14 @@ export class ImagePlot {
     if (!this.data) return drawEmpty(ctx, w, h, t, this.opts.empty);
     if (this.dirty) this.rebuild();
     const { x0, x1, y0, y1 } = this.data;
-    const cb = 64;
-    const m = { l: 48, r: cb + 8, t: 10, b: 34 };
+    // Colorbar gutter sized to its labels, so wider (e.g. monospace) chart fonts do not clip them.
+    const [lo, hi] = this.dr;
+    const cbTicks = niceTicks(lo, hi, Math.max(2, Math.floor((h - 44) / 40)));
+    const cbText = (v) => (this.opts.scale === 'log' ? `${fmt(v, 3)} dB` : fmt(this.opts.scale === 'sqrt' ? v * v : v, 3));
+    ctx.font = t.font;
+    const labelW = Math.max(0, ...cbTicks.map((v) => ctx.measureText(cbText(v)).width));
+    const cb = 14 + 10 + 4 + labelW + (this.opts.cbLabel ? 18 : 4);
+    const m = { l: 48, r: cb, t: 10, b: 34 };
     let W = w - m.l - m.r, H = h - m.t - m.b;
     if (this.opts.sky || this.opts.equal) { const s = Math.min(W, H); W = s; H = s; }
     const L = m.l + (w - m.l - m.r - W) / 2, T = m.t + (h - m.t - m.b - H) / 2;
@@ -622,7 +630,6 @@ export class ImagePlot {
 
     // Colorbar
     const bx = L + W + 14, bw = 10;
-    const [lo, hi] = this.dr;
     const L8 = lut(this.opts.cmap);
     for (let i = 0; i < H; i++) {
       const k = Math.round((1 - i / H) * 255) * 3;
@@ -630,9 +637,9 @@ export class ImagePlot {
       ctx.fillRect(bx, T + i, bw, 1.5);
     }
     ctx.fillStyle = t.muted; ctx.textAlign = 'left'; ctx.textBaseline = 'middle';
-    for (const v of niceTicks(lo, hi, Math.max(2, Math.floor(H / 40)))) {
+    for (const v of cbTicks) {
       const y = T + H - ((v - lo) / (hi - lo)) * H;
-      ctx.fillText(this.opts.scale === 'log' ? `${fmt(v, 3)} dB` : fmt(this.opts.scale === 'sqrt' ? v * v : v, 3), bx + bw + 4, y);
+      ctx.fillText(cbText(v), bx + bw + 4, y);
     }
     if (this.opts.cbLabel) {
       ctx.save(); ctx.translate(w - 6, T + H / 2); ctx.rotate(-Math.PI / 2);

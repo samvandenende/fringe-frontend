@@ -6,13 +6,16 @@
   <title>Fringe Simulation Environment</title>
   <link rel="icon" href="logo.png">
   <link rel="stylesheet" href="style.css">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&family=Space+Grotesk:wght@500;700&display=swap">
 </head>
 <body>
   <header class="topbar">
     <div class="brand">
       <img src="logo.png" alt="" width="26" height="26">
       <span class="name">fringe</span>
-      <span class="sub">simulation environment</span>
+      <span class="tagline">simulation environment</span>
     </div>
     <nav class="repo-links" aria-label="Source code">
       <a href="https://github.com/samvandenende/fringe" target="_blank" rel="noopener" title="fringe simulator on GitHub" aria-label="fringe on GitHub"><svg width="14" height="14" viewBox="0 0 16 16" aria-hidden="true"><path fill="currentColor" d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg><span>fringe</span></a>
@@ -48,8 +51,18 @@
             <select id="freq-res"><option>1</option><option>2</option><option selected>4</option><option>8</option><option>16</option></select>
           </div>
           <div class="field">
-            <label for="integrations" title="Number of consecutive sample windows">Integrations</label>
+            <label for="integrations" title="Number of consecutive sample windows">Integrations <span class="hint" id="integrations-hint"></span></label>
             <input id="integrations" type="number" min="1" max="100000" value="20">
+          </div>
+        </div>
+        <div class="row2">
+          <div class="field">
+            <label for="tl-epoch" title="UTC time of the first integration">Start epoch <span class="unit">UTC</span></label>
+            <input id="tl-epoch" type="datetime-local" step="1" value="2026-01-01T00:00:00">
+          </div>
+          <div class="field">
+            <label for="tl-interval" title="Time between the starts of consecutive integrations; blank runs them back to back (one window apart)">Interval <span class="unit">s</span></label>
+            <input id="tl-interval" type="number" step="any" min="0">
           </div>
         </div>
         <div class="field">
@@ -93,7 +106,11 @@
             <label for="window-size">Window size</label>
             <select id="window-size"></select>
           </div>
-          <div class="field"><label for="noise" title="System noise intensity (fringe units)">System noise</label><input id="noise" type="number" step="any" min="0"></div>
+          <div class="field">
+            <label for="noise" title="System noise power spectral density k_B·T_sys in Jy m² (1 Jy m² = 10⁻²⁶ W/Hz), received as a flux density of k_B·T_sys / A_eff with A_eff = min(λ²/4, 4 m²)">System noise k<sub>B</sub>T<sub>sys</sub> <span class="unit">Jy m²</span></label>
+            <input id="noise" type="number" step="any" min="0">
+            <p class="note" id="noise-note"></p>
+          </div>
         </div>
         <p class="error" id="array-error" hidden></p>
       </details>
@@ -113,7 +130,7 @@
           <div class="row3">
             <div class="field"><label for="sky-n">Sources</label><input id="sky-n" type="number" value="500" min="1"></div>
             <div class="field"><label for="sky-seed">Seed</label><input id="sky-seed" type="number" value="1"></div>
-            <div class="field"><label for="sky-alpha">Index α</label><input id="sky-alpha" type="number" value="-0.7" step="0.1"></div>
+            <div class="field"><label for="sky-alpha">Index <span class="sym">α</span></label><input id="sky-alpha" type="number" value="-0.7" step="0.1"></div>
           </div>
           <div class="btn-row">
             <button class="btn small" id="sky-generate">Replace</button>
@@ -123,7 +140,7 @@
         <details class="sub" id="gsm-section">
           <summary>Generate from GSM2016 (PyGDSM)</summary>
           <p class="note warn" id="gsm-unavailable" hidden></p>
-          <div class="row2">
+          <div class="row3">
             <div class="field">
               <label for="gsm-nside" title="HEALPix NSIDE: one source per pixel">NSIDE</label>
               <select id="gsm-nside">
@@ -132,8 +149,12 @@
               </select>
             </div>
             <div class="field">
-              <label for="gsm-maps" title="Number of GSM maps across the frequency range used to fit each pixel's spectral index">Fit maps</label>
+              <label for="gsm-maps" title="Number of GSM maps across the frequency range used to fit each pixel's spectrum">Fit maps</label>
               <input id="gsm-maps" type="number" value="5" min="2" max="256" step="1">
+            </div>
+            <div class="field">
+              <label for="gsm-order" title="Spectrum fitted per pixel: a power law, or a log-polynomial with 2nd- and 3rd-order spectral indices (at most maps − 1)">Spectrum</label>
+              <select id="gsm-order"><option value="1">Power law</option><option value="2">2nd order</option><option value="3" selected>3rd order</option></select>
             </div>
           </div>
           <div class="row3">
@@ -170,40 +191,167 @@
           <div class="row3">
             <div class="field"><label for="src-ra">RA <span class="unit">°</span></label><input id="src-ra" type="number" value="0" step="any"></div>
             <div class="field"><label for="src-dec">Dec <span class="unit">°</span></label><input id="src-dec" type="number" value="60" step="any"></div>
-            <div class="field"><label for="src-i">I₀</label><input id="src-i" type="number" value="100000" step="any" min="0"></div>
+            <div class="field"><label for="src-i" title="Flux density at f₀">S₀ <span class="unit">Jy</span></label><input id="src-i" type="number" value="100000" step="any" min="0"></div>
           </div>
           <div class="row3">
-            <div class="field"><label for="src-f0">f₀ <span class="unit">MHz</span></label><input id="src-f0" type="number" value="30" step="any" min="0"></div>
-            <div class="field"><label for="src-alpha">Index α</label><input id="src-alpha" type="number" value="-0.7" step="any"></div>
+            <div class="field"><label for="src-f0"><span class="sym">f₀</span> <span class="unit">MHz</span></label><input id="src-f0" type="number" value="30" step="any" min="0"></div>
+            <div class="field"><label for="src-alpha" title="First-order (power-law) spectral index">Index <span class="sym">α₁</span></label><input id="src-alpha" type="number" value="-0.7" step="any"></div>
+            <div class="field"><label for="src-alpha2" title="Second-order spectral index (curvature)"><span class="sym">α₂</span></label><input id="src-alpha2" type="number" value="0" step="any"></div>
+          </div>
+          <div class="row3">
+            <div class="field"><label for="src-alpha3" title="Third-order spectral index"><span class="sym">α₃</span></label><input id="src-alpha3" type="number" value="0" step="any"></div>
             <div class="field"><label>&nbsp;</label><button class="btn small" id="src-add">Add</button></div>
           </div>
+          <p class="note">S(f) = S₀ · exp(α₁x + α₂x² + α₃x³) with x = ln(f / f₀): a power law when α₂ = α₃ = 0.</p>
         </details>
         <div class="source-list" id="source-list"></div>
+        <div class="over-time">
+          <div class="over-time-head">Over the timeline</div>
+          <div class="field">
+            <label for="sky-rotation">Sky rotation</label>
+            <select id="sky-rotation">
+              <option value="none">None: fixed in the array frame</option>
+              <option value="lunar">Lunar far side (ephemeris)</option>
+              <option value="constant">Constant rate about an axis</option>
+            </select>
+          </div>
+          <div class="row2" id="rot-constant-params" hidden>
+            <div class="field">
+              <label for="rot-rate" title="Sky rotation rate. The lunar sidereal rate is 0.549 °/h; Earth's is 15.04 °/h">Rate <span class="unit">°/h</span></label>
+              <input id="rot-rate" type="number" step="any" value="0.549">
+            </div>
+            <div class="field">
+              <label for="rot-axis" title="Spin axis of the observer: the local north axis for a site on the equator, the zenith for one at a pole">Axis</label>
+              <select id="rot-axis"><option value="north">North, y (equator)</option><option value="up">Zenith, z (pole)</option></select>
+            </div>
+          </div>
+          <div id="rot-sky" hidden>
+            <label class="check"><input type="radio" name="rot-sky" value="gsm" checked> GSM2016, all sky</label>
+            <div class="row3 indent" id="rot-gsm-params">
+              <div class="field">
+                <label for="rot-nside">NSIDE</label>
+                <select id="rot-nside"><option>8</option><option>16</option><option selected>32</option><option>64</option></select>
+              </div>
+              <div class="field"><label for="rot-maps">Fit maps</label><input id="rot-maps" type="number" min="2" max="64" value="5"></div>
+              <div class="field">
+                <label for="rot-order" title="Spectrum fitted per pixel: a power law, or a log-polynomial with 2nd- and 3rd-order spectral indices (at most maps − 1)">Spectrum</label>
+                <select id="rot-order"><option value="1">Power law</option><option value="2">2nd order</option><option value="3" selected>3rd order</option></select>
+              </div>
+            </div>
+            <label class="check"><input type="radio" name="rot-sky" value="model"> <span id="rot-model-label">The sky model above</span></label>
+          </div>
+          <p class="note" id="rot-note"></p>
+        </div>
       </details>
 
-      <!-- Calibrator -->
+      <!-- Calibrators -->
       <details class="group">
-        <summary>Calibrator <span class="badge" id="cal-badge"></span></summary>
-        <label class="check"><input type="checkbox" id="cal-enabled"> Include calibrator source</label>
-        <div class="row3">
-          <div class="field"><label for="cal-x">x <span class="unit">m</span></label><input id="cal-x" type="number" step="any"></div>
-          <div class="field"><label for="cal-y">y <span class="unit">m</span></label><input id="cal-y" type="number" step="any"></div>
-          <div class="field"><label for="cal-z">z <span class="unit">m</span></label><input id="cal-z" type="number" step="any"></div>
+        <summary>Calibrators <span class="badge" id="cal-badge"></span></summary>
+        <div class="cal-list" id="cal-list" role="tablist" aria-label="Calibrators"></div>
+        <div class="field">
+          <div class="segmented" id="cal-mode">
+            <button data-value="off" class="on" title="This calibrator is not simulated (its settings are kept)">Off</button>
+            <button data-value="fixed" title="A position, velocity and acceleration at the start epoch; the calibrator moves with constant acceleration from there">Kinematic</button>
+            <button data-value="series" title="One position (and optionally velocity) per integration, from a CSV or Python">Series</button>
+          </div>
         </div>
-        <div class="field"><label for="cal-i">Intensity</label><input id="cal-i" type="number" step="any" min="0"></div>
+        <div id="cal-fixed" hidden>
+          <p class="note">At the start epoch, in the array frame (x = east, y = north, z = up); the calibrator then moves as p + v·t + a·t²/2. Velocity sets the Doppler shift.</p>
+          <div class="kin-grid">
+            <span class="kin-h">x (east)</span><span class="kin-h">y (north)</span><span class="kin-h">z (up)</span>
+            <label for="cal-x">Position <span class="unit">m</span></label>
+            <input id="cal-x" type="number" step="any" aria-label="Position x (m)"><input id="cal-y" type="number" step="any" aria-label="Position y (m)"><input id="cal-z" type="number" step="any" aria-label="Position z (m)">
+            <label for="cal-vx">Velocity <span class="unit">m/s</span></label>
+            <input id="cal-vx" type="number" step="any" aria-label="Velocity x (m/s)"><input id="cal-vy" type="number" step="any" aria-label="Velocity y (m/s)"><input id="cal-vz" type="number" step="any" aria-label="Velocity z (m/s)">
+            <label for="cal-ax">Acceleration <span class="unit">m/s²</span></label>
+            <input id="cal-ax" type="number" step="any" aria-label="Acceleration x (m/s²)"><input id="cal-ay" type="number" step="any" aria-label="Acceleration y (m/s²)"><input id="cal-az" type="number" step="any" aria-label="Acceleration z (m/s²)">
+          </div>
+          <div class="btn-row">
+            <button class="btn small ghost" data-cal-preset="drone" title="Hovering 150 m above the array centre">Drone 150 m</button>
+            <button class="btn small ghost" data-cal-preset="lunar" title="Low lunar orbit at 100 km, overhead at the start (1.63 km/s, centripetal acceleration)">Lunar orbiter</button>
+            <button class="btn small ghost" data-cal-preset="satellite" title="Earth satellite at 550 km altitude and 30° elevation, approaching at 7.6 km/s">Satellite 550 km</button>
+          </div>
+        </div>
+        <div id="cal-series" hidden>
+          <p class="note">One state per integration in the array frame: a CSV with x, y, z columns (m) and optionally vx, vy, vz (m/s), ax, ay, az (m/s²) and power (W), or a Python function.</p>
+          <div class="btn-row">
+            <label class="btn small file">Load CSV<input type="file" id="series-file" accept=".csv,.txt,.tsv,text/csv" hidden></label>
+            <button class="btn small" id="series-python" title="Write a Python function that computes the trajectory, e.g. an orbit">Python…</button>
+            <button class="btn small ghost" id="series-template" title="Download an example positions file">Template</button>
+            <button class="btn small ghost" id="series-export" title="Download the current states">Export</button>
+          </div>
+          <div class="field">
+            <label for="series-origin">Positions relative to</label>
+            <select id="series-origin"><option value="centroid">Array centroid</option><option value="array">Array origin (0, 0, 0)</option></select>
+          </div>
+          <label class="check" title="Central differences of the positions over the integration times, for rows without a velocity"><input type="checkbox" id="series-doppler" checked> Estimate velocity (Doppler) from successive positions</label>
+          <div class="note warn" id="series-mismatch" hidden>
+            <span id="series-mismatch-text"></span>
+            <div class="btn-row">
+              <button class="btn small" id="series-drop"></button>
+              <button class="btn small" id="series-fit"></button>
+            </div>
+          </div>
+          <p class="note" id="series-summary"></p>
+        </div>
+        <div id="cal-common" hidden>
+          <div class="over-time">
+          <div class="over-time-head">Transmitter</div>
+          <div class="row2">
+            <div class="field"><label for="tx-freq" title="Carrier frequency (physical)">Carrier <span class="unit">MHz</span></label><input id="tx-freq" type="number" step="any" min="0"></div>
+            <div class="field"><label for="tx-rate" title="Rate at which buffer samples are played out">Sample rate <span class="unit">MHz</span></label><input id="tx-rate" type="number" step="any" min="0"></div>
+          </div>
+          <div class="row2">
+            <div class="field"><label for="tx-power" title="Equivalent isotropically radiated power. The buffer is scaled to radiate this power whatever its RMS; parts of its spectrum outside the filter bandwidth or the array's bandpass are lost. Series rows with a power column override it">EIRP <span class="unit">W</span></label><input id="tx-power" type="number" step="any" min="0"></div>
+            <div class="field">
+              <label>&nbsp;</label>
+              <button class="btn small" id="tx-auto" title="Set the power so the calibrator is 10 dB above sky + noise per bin at its closest approach">Auto (+10 dB)</button>
+            </div>
+          </div>
+          <div class="row2">
+            <div class="field"><label for="tx-bw" title="Reconstruction filter bandwidth of the transmitter; blank for none">Bandwidth <span class="unit">MHz</span></label><input id="tx-bw" type="number" step="any" min="0" placeholder="none"></div>
+            <div class="field"><label for="tx-start" title="Time of the first buffer sample, in seconds after the start epoch">Buffer start <span class="unit">s</span></label><input id="tx-start" type="number" step="any" placeholder="0"></div>
+          </div>
+          <div class="field">
+            <label for="tx-wave">Waveform (cyclic buffer)</label>
+            <select id="tx-wave">
+              <option value="noise">White noise</option>
+              <option value="prn">PRN code (BPSK m-sequence)</option>
+              <option value="chirp">Linear chirp</option>
+              <option value="tone">Tone (CW at the carrier)</option>
+              <option value="file">From a file (.cf32)</option>
+              <option value="python">Python buffer(ctx)</option>
+            </select>
+          </div>
+          <div class="row2" id="tx-params">
+            <div class="field" id="tx-length-field"><label for="tx-length">Length <span class="unit">samples</span></label><input id="tx-length" type="number" min="1" step="1"></div>
+            <div class="field" id="tx-seed-field"><label for="tx-seed">Seed</label><input id="tx-seed" type="number" step="1"></div>
+            <div class="field" id="tx-degree-field"><label for="tx-degree">Code length</label><select id="tx-degree"></select></div>
+          </div>
+          <div class="btn-row" id="tx-file-row" hidden>
+            <label class="btn small file">Load .cf32<input type="file" id="tx-file" accept=".cf32,.bin,.iq,.raw,application/octet-stream" hidden></label>
+          </div>
+          <div class="btn-row" id="tx-python-row" hidden>
+            <button class="btn small" id="tx-python" title="Write a Python function that returns the buffer">Python…</button>
+          </div>
+          <div class="btn-row">
+            <button class="btn small ghost" id="tx-fit" title="Carrier at the band centre, sample rate = the band's width">Fit to band</button>
+            <button class="btn small ghost" id="tx-export-buffer" title="Download the buffer as raw interleaved float32 IQ (cf32_le)">Export buffer</button>
+          </div>
+          <p class="note" id="tx-summary"></p>
+          </div>
+        </div>
         <div class="btn-row">
-          <button class="btn small ghost" data-cal-preset="drone">Drone 150 m</button>
-          <button class="btn small ghost" data-cal-preset="satellite">Satellite 550 km</button>
+          <label class="btn small file" title="fringe calibrators JSON together with its .cf32 buffer files (select them all); replaces the selected calibrator and adds any others after it">Load JSON + cf32<input type="file" id="cal-file" accept=".json,.cf32,application/json" multiple hidden></label>
+          <button class="btn small" id="cal-export" title="The kinematic calibrators as a fringe calibrators JSON and their .cf32 buffer files">Export</button>
+          <button class="btn small ghost" id="cal-remove" title="Remove the selected calibrator">Remove</button>
         </div>
-        <div class="btn-row">
-          <label class="btn small file">Load JSON<input type="file" id="cal-file" accept=".json,application/json" hidden></label>
-          <button class="btn small" id="cal-export">Export</button>
-        </div>
+        <label class="check" id="cal-skip-label" title="Below the horizon a calibrator transmits nothing; integrations with every calibrator below it are left out of the run"><input type="checkbox" id="cal-skip"> Switch calibrators off below the horizon, and skip integrations with none above</label>
       </details>
 
       <!-- Analysis -->
       <details class="group">
-        <summary>Analysis</summary>
+        <summary>Analysis &amp; output <span class="badge" id="output-badge"></span></summary>
         <div class="row2">
           <div class="field">
             <label for="window-fn">Window function</label>
@@ -214,15 +362,43 @@
             <input id="channels" type="number" min="1" max="1024" value="64">
           </div>
         </div>
-        <p class="note">Spectra are averaged over all integrations. Per-integration E-fields at the imaging channels are kept on the server so images can be formed at any of them after the run.</p>
+        <p class="note">Spectra are averaged over all integrations and shown under Signals; images at the imaging channels under Imaging.</p>
+        <div class="over-time">
+          <div class="over-time-head">Save to HDF5</div>
+          <label class="check"><input type="checkbox" id="prod-raw"> Raw antenna samples <span class="hint" id="prod-raw-size"></span></label>
+          <label class="check" id="prod-tdoa-label"><input type="checkbox" id="prod-tdoa"> Calibrator TDOA (relative time of arrival) <span class="hint" id="prod-tdoa-size"></span></label>
+          <div class="row2 indent" id="prod-tdoa-params">
+            <div class="field">
+              <label for="prod-ref" title="TDOAs are measured relative to this antenna">Reference antenna</label>
+              <input id="prod-ref" type="number" min="0" step="1" value="0">
+            </div>
+            <div class="field"><label>&nbsp;</label><button class="btn small ghost" id="prod-ref-centre">Nearest centroid</button></div>
+          </div>
+          <label class="check"><input type="checkbox" id="prod-images"> Sky image per integration <span class="hint" id="prod-images-size"></span></label>
+          <div class="row3 indent" id="prod-images-params">
+            <div class="field"><label for="prod-img-f">Freq. <span class="unit">MHz</span></label><input id="prod-img-f" type="number" step="any" value="30"></div>
+            <div class="field"><label for="prod-img-bw" title="Images of all bins in this band are averaged">Bandw. <span class="unit">MHz</span></label><input id="prod-img-bw" type="number" step="any" min="0" value="1"></div>
+            <div class="field">
+              <label for="prod-img-size">Pixels</label>
+              <select id="prod-img-size"><option>32</option><option selected>64</option><option>128</option><option>256</option></select>
+            </div>
+          </div>
+          <div class="field" id="out-name-field">
+            <label for="out-name">File name</label>
+            <input id="out-name" type="text" value="fringe_run" spellcheck="false">
+          </div>
+          <p class="note" id="output-note"></p>
+        </div>
       </details>
     </aside>
+    <div class="sidebar-resizer" id="sidebar-resizer" role="separator" aria-orientation="vertical" aria-label="Resize sidebar" tabindex="0" title="Drag to resize · double-click to reset"></div>
 
     <main class="main">
       <nav class="tabs" role="tablist">
         <button role="tab" data-tab="environment" class="on">Environment</button>
         <button role="tab" data-tab="signals">Signals <span class="tab-dot" id="signals-dot" hidden></span></button>
         <button role="tab" data-tab="imaging">Imaging <span class="tab-dot" id="imaging-dot" hidden></span></button>
+        <button role="tab" data-tab="outputs">Outputs <span class="tab-dot" id="outputs-dot" hidden></span></button>
       </nav>
 
       <!-- Environment -->
@@ -238,15 +414,30 @@
             <select id="env-cmap"></select>
           </div>
           <div class="tool">
-            <label for="sky-scale">Intensity scale</label>
+            <label for="sky-scale">Flux scale</label>
             <select id="sky-scale"><option value="auto">Auto</option><option value="linear">Linear</option><option value="log">Log</option></select>
           </div>
           <label class="check tool"><input type="checkbox" id="apparent" checked> Apparent (× z² gain)</label>
           <label class="check tool"><input type="checkbox" id="rotate"> Auto-rotate</label>
         </div>
+        <div class="timeline-bar" id="timeline-bar">
+          <div class="toolbar">
+            <button class="icon-btn" id="tl-play" aria-label="Play">▶</button>
+            <div class="tool grow">
+              <label for="tl-step">Integration</label>
+              <input type="range" id="tl-step" min="0" max="0" value="0">
+              <output id="tl-step-out"></output>
+            </div>
+            <div class="tool">
+              <label for="tl-speed">Speed</label>
+              <select id="tl-speed"><option value="2">2 steps/s</option><option value="5">5 steps/s</option><option value="10" selected>10 steps/s</option><option value="30">30 steps/s</option></select>
+            </div>
+          </div>
+          <div class="tiles compact" id="tl-tiles"></div>
+        </div>
         <div class="grid env-grid">
           <article class="card span-2 tall">
-            <header><h3>Scene</h3><p>Array, sky sphere and calibrator in fringe's local frame (z = zenith)</p></header>
+            <header><h3>Scene</h3><p>Array, sky sphere and calibrators in fringe's local frame (z = zenith)</p></header>
             <div class="viz" id="scene"></div>
           </article>
           <article class="card tall">
@@ -265,8 +456,16 @@
             <header><h3>Array beam</h3><p id="beam-caption">Zenith-steered power pattern</p></header>
             <div class="viz square" id="beam-view"></div>
           </article>
+          <article class="card span-3" id="tl-charts" hidden>
+            <header><h3>Over the timeline</h3><p id="tl-charts-caption"></p></header>
+            <div class="tl-charts" id="tl-charts-grid">
+              <div class="viz short" id="tl-power-plot"></div>
+              <div class="viz short" id="tl-elev-plot"></div>
+              <div class="viz short" id="tl-doppler-plot"></div>
+            </div>
+          </article>
           <article class="card span-3">
-            <header><h3>Spectral model</h3><p>Expected per-bin power by component, as fringe synthesises it</p></header>
+            <header><h3>Spectral model</h3><p>Expected per-bin power (received flux density, Jy) by component, as fringe synthesises it</p></header>
             <div class="viz wide" id="model-spectrum"></div>
           </article>
         </div>
@@ -351,7 +550,7 @@
               <div class="viz square" id="dirty-image"></div>
             </article>
             <article class="card">
-              <header><h3>Expected image</h3><p>Sky model ⊛ array pattern + noise floor (calibrator as far-field point)</p></header>
+              <header><h3>Expected image</h3><p>Sky model ⊛ array pattern + noise floor (calibrators as far-field points)</p></header>
               <div class="viz square" id="expected-image"></div>
             </article>
             <article class="card">
@@ -361,12 +560,38 @@
           </div>
         </div>
       </section>
+      <!-- Outputs -->
+      <section class="tab-panel" id="tab-outputs" hidden>
+        <div class="empty-state" id="outputs-empty">
+          <h3>No saved outputs yet</h3>
+          <p>Select data products under <b>Analysis &amp; output</b> and run. Raw samples, calibrator TDOAs and per-integration images are written to an HDF5 file you can download here.</p>
+        </div>
+        <div class="grid out-grid">
+          <article class="card span-2" id="out-results-card" hidden>
+            <header><h3>Latest saved run</h3><p id="out-results-caption"></p></header>
+            <div class="tiles compact" id="out-result-tiles"></div>
+            <div class="viz short" id="out-tdoa-plot"></div>
+          </article>
+          <article class="card" id="out-files-card">
+            <header><h3>Output files</h3><p id="out-files-caption"></p></header>
+            <div class="output-list" id="out-files"></div>
+          </article>
+        </div>
+      </section>
     </main>
   </div>
 
+  <dialog class="modal small" id="choice-dialog" aria-labelledby="choice-title">
+    <form method="dialog">
+      <header class="modal-head"><h2 id="choice-title"></h2></header>
+      <p class="modal-text" id="choice-text"></p>
+      <footer class="modal-foot" id="choice-buttons"></footer>
+    </form>
+  </dialog>
+
   <dialog class="modal" id="py-dialog" aria-labelledby="py-title">
     <header class="modal-head">
-      <h2 id="py-title">Python array layout</h2>
+      <h2 id="py-title">Python</h2>
       <div class="tool">
         <label for="py-example">Examples</label>
         <select id="py-example"><option value="">Load an example…</option></select>
@@ -374,19 +599,13 @@
       <button class="icon-btn" id="py-close" aria-label="Close">✕</button>
     </header>
     <div class="modal-body">
-      <section class="py-code">
-        <div id="py-editor"></div>
-        <div class="py-console" id="py-console" aria-live="polite"></div>
-      </section>
-      <section class="py-preview">
-        <div class="viz square" id="py-preview"></div>
-        <div class="py-stats" id="py-stats"></div>
-      </section>
+      <section class="py-code" id="py-code"></section>
+      <section class="py-preview" id="py-preview"></section>
     </div>
     <footer class="modal-foot">
-      <p class="note" id="py-hint">Runs <code>layout(ctx)</code> with the server's Python (<code>--python</code>) · <kbd>Ctrl</kbd>+<kbd>Enter</kbd> to run · <kbd>Ctrl</kbd>+<kbd>/</kbd> comments</p>
+      <p class="note" id="py-hint">Runs <code id="py-fn">layout(ctx)</code> with the server's Python (<code>--python</code>) · <kbd>Ctrl</kbd>+<kbd>Enter</kbd> to run · <kbd>Ctrl</kbd>+<kbd>/</kbd> comments</p>
       <button class="btn" id="py-run">▶ Run</button>
-      <button class="btn primary" id="py-apply" disabled>Apply to array</button>
+      <button class="btn primary" id="py-apply" disabled>Apply</button>
     </footer>
   </dialog>
 

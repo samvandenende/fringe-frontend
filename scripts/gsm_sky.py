@@ -3,11 +3,14 @@
 
 Every HEALPix pixel at the requested NSIDE becomes one source at the pixel centre. GSM2016
 maps are generated in MJy/sr at `--maps` frequencies spanning [fmin, fmax], converted to Jansky
-per pixel (× 1e6 × pixel solid angle), and a power law S(f) = S_ref (f / f_ref)^α is fitted per
-pixel in log space, with f_ref the geometric mean of the map frequencies.
+per pixel (× 1e6 × pixel solid angle), and fringe's log-polynomial spectrum
+S(f) = S_ref exp(α₁x + α₂x² + α₃x³), x = ln(f / f_ref), is fitted per pixel by least squares in
+ln S, with f_ref the geometric mean of the map frequencies. --order sets the highest order fitted
+(1 is a power law, 3 the default); it is capped at maps − 1, and the higher indices are 0.
 
-GSM2016 contains non-positive pixels at low frequencies; those samples are left out of the
-fit. Pixels with fewer than two positive samples get α = 0 and S_ref = max(mean S, 0).
+GSM2016 contains non-positive pixels at low frequencies; those samples are left out of the fit,
+whose order drops if too few remain. Pixels with fewer than two positive samples get α = 0 and
+S_ref = max(mean S, 0).
 
 Frames (what is written as right_ascension / declination; fringe's zenith is declination +90°):
 
@@ -24,7 +27,7 @@ The CSV goes to --output (default stdout). A one-line JSON summary prefixed with
 is written to stderr.
 
 Example:
-    python3 gsm_sky.py --nside 32 --maps 5 --fmin 15e6 --fmax 45e6 --output sky.csv
+    python3 gsm_sky.py --nside 32 --maps 5 --order 3 --fmin 15e6 --fmax 45e6 --output sky.csv
 """
 
 import argparse
@@ -36,7 +39,9 @@ import sys
 def parse_args():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--nside", type=int, default=32, help="HEALPix NSIDE of the output sky (power of two)")
-    p.add_argument("--maps", type=int, default=5, help="number of GSM maps used to fit the spectral index (>= 2)")
+    p.add_argument("--maps", type=int, default=5, help="number of GSM maps used to fit the spectral indices (>= 2)")
+    p.add_argument("--order", type=int, choices=[1, 2, 3], default=3,
+                   help="order of the log-polynomial spectrum fitted per pixel (1 = power law; at most maps - 1)")
     p.add_argument("--fmin", type=float, required=True, help="lowest map frequency in Hz (>= 10 MHz)")
     p.add_argument("--fmax", type=float, required=True, help="highest map frequency in Hz")
     p.add_argument("--frame", choices=["lunar-farside", "equatorial", "galactic"], default="lunar-farside",
@@ -116,25 +121,34 @@ def main():
             mjysr = gsm.generate(f / 1e6)  # galactic, RING ordering
             flux[i] = hp.ud_grade(mjysr, args.nside, order_in="RING", order_out="RING") * 1e6 * pixel_sr
 
-        # Least-squares power law in log space around the geometric-mean frequency.
+        # Least-squares log-polynomial spectrum around the geometric-mean frequency, as fringe's
+        # S(f) = S0 exp(a1 x + a2 x^2 + a3 x^3) with x = ln(f / f_ref). Pixels with non-positive
+        # samples are fitted to the rest, at a lower order if too few remain.
         f_ref = float(np.exp(np.mean(np.log(freqs))))
-        x = np.log(freqs / f_ref)[:, None] * np.ones((1, npix))
+        order = max(1, min(args.order, args.maps - 1))
+        x = np.log(freqs / f_ref)
         valid = flux > 0
         y = np.log(np.where(valid, flux, 1.0))
         n = valid.sum(axis=0)
-        sx = np.where(valid, x, 0).sum(axis=0)
-        sy = np.where(valid, y, 0).sum(axis=0)
-        sxx = np.where(valid, x * x, 0).sum(axis=0)
-        sxy = np.where(valid, x * y, 0).sum(axis=0)
-        denom = n * sxx - sx * sx
-        fit = (n >= 2) & (denom > 0)
-        alpha = np.where(fit, (n * sxy - sx * sy) / np.where(fit, denom, 1), 0.0)
-        log_ref = np.where(fit, (sy - alpha * sx) / np.maximum(n, 1), 0.0)
-        s_ref = np.where(fit, np.exp(log_ref), np.maximum(flux.mean(axis=0), 0.0))
-        partial = int(((n < args.maps) & fit).sum())
+        vander = np.vander(x, order + 1, increasing=True)  # (maps, order + 1): 1, x, x^2, ...
+        coef = np.zeros((4, npix))  # ln S0, a1, a2, a3
+        full = n == args.maps
+        if full.any():
+            coef[:order + 1, full] = np.linalg.lstsq(vander, y[:, full], rcond=None)[0]
+        fit = n >= 2
+        partial_pixels = np.flatnonzero(fit & ~full)
+        if partial_pixels.size:
+            masks, groups = np.unique(valid[:, partial_pixels].T, axis=0, return_inverse=True)
+            for g, mask in enumerate(masks):
+                pix = partial_pixels[groups.ravel() == g]
+                k = min(order, int(mask.sum()) - 1)
+                coef[:k + 1, pix] = np.linalg.lstsq(vander[mask, :k + 1], y[mask][:, pix], rcond=None)[0]
+        s_ref = np.where(fit, np.exp(coef[0]), np.maximum(flux.mean(axis=0), 0.0))
+        alpha = coef[1:]  # (3, npix): spectral_index, spectral_index_2, spectral_index_3
+        partial = int(partial_pixels.size)
         fallback = int((~fit).sum())
 
-        residual = np.where(valid & fit, y - (log_ref + alpha * x), 0)
+        residual = np.where(valid & fit, y - vander @ coef[:order + 1], 0)
         fit_rms = float(np.sqrt((residual ** 2).sum() / max(1, (valid & fit).sum())))
 
         lon, lat = hp.pix2ang(args.nside, np.arange(npix), lonlat=True)  # galactic l, b in degrees
@@ -180,9 +194,9 @@ def main():
         keep = np.ones(npix, bool) if args.all_sky else dec > 0
 
     out = sys.stdout if args.output == "-" else open(args.output, "w")
-    out.write("right_ascension,declination,reference_frequency,reference_intensity,spectral_index\n")
-    for r, d, s, a in zip(ra[keep], dec[keep], s_ref[keep], alpha[keep]):
-        out.write(f"{float(r)!r},{float(d)!r},{f_ref!r},{float(s)!r},{float(a)!r}\n")
+    out.write("right_ascension,declination,reference_frequency,reference_intensity,spectral_index,spectral_index_2,spectral_index_3\n")
+    for r, d, s, a1, a2, a3 in zip(ra[keep], dec[keep], s_ref[keep], *alpha[:, keep]):
+        out.write(f"{float(r)!r},{float(d)!r},{f_ref!r},{float(s)!r},{float(a1)!r},{float(a2)!r},{float(a3)!r}\n")
     if out is not sys.stdout:
         out.close()
 
@@ -197,7 +211,10 @@ def main():
         "reference_frequency": f_ref,
         "pixel_solid_angle_sr": float(pixel_sr),
         "total_flux_jy": float(s_ref[keep].sum()),
-        "alpha_percentiles": [float(v) for v in np.percentile(alpha[keep], [1, 50, 99])] if keep.any() else [],
+        "spectral_order": order,
+        "alpha_percentiles": [float(v) for v in np.percentile(alpha[0, keep], [1, 50, 99])] if keep.any() else [],
+        "alpha2_percentiles": [float(v) for v in np.percentile(alpha[1, keep], [1, 50, 99])] if keep.any() and order >= 2 else [],
+        "alpha3_percentiles": [float(v) for v in np.percentile(alpha[2, keep], [1, 50, 99])] if keep.any() and order >= 3 else [],
         "fit_rms_ln": fit_rms,
         "pixels_with_nonpositive_samples": partial,
         "pixels_without_fit": fallback,

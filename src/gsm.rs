@@ -32,6 +32,9 @@ pub enum Resolution {
 pub struct GsmRequest {
     pub nside: u32,
     pub maps: u32,
+    /// Highest order of the log-polynomial spectrum fitted per pixel (1 = power law, at most 3).
+    #[serde(default = "default_order")]
+    pub order: u32,
     /// Map frequency range in Hz.
     pub fmin: f64,
     pub fmax: f64,
@@ -40,6 +43,10 @@ pub struct GsmRequest {
     pub epoch: Option<String>,
     pub resolution: Resolution,
     pub above_horizon: bool,
+}
+
+fn default_order() -> u32 {
+    3
 }
 
 #[derive(Serialize)]
@@ -56,6 +63,9 @@ impl GsmRequest {
         }
         if !(2..=256).contains(&self.maps) {
             return Err("the number of maps must be between 2 and 256".into());
+        }
+        if !(1..=3).contains(&self.order) {
+            return Err("the spectral order must be 1, 2 or 3".into());
         }
         if !(self.fmin.is_finite() && self.fmin >= 10e6) {
             return Err("GSM2016 is only defined above 10 MHz".into());
@@ -95,6 +105,7 @@ pub async fn generate(python: &str, req: GsmRequest) -> Result<GsmResponse, Stri
         .arg(SCRIPT)
         .args(["--nside", &req.nside.to_string()])
         .args(["--maps", &req.maps.to_string()])
+        .args(["--order", &req.order.to_string()])
         .args(["--fmin", &req.fmin.to_string()])
         .args(["--fmax", &req.fmax.to_string()])
         .args([

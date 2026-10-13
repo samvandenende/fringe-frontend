@@ -1,4 +1,5 @@
-//! User-written Python array layouts, run by `scripts/layout_runner.py`.
+//! User-written Python functions (array layouts, calibrator trajectories and transmit buffers), run by
+//! `scripts/python_runner.py`.
 //!
 //! This executes arbitrary code as the server's user, so it is only enabled when the server is
 //! bound to a loopback address (or explicitly allowed), and requests must carry a loopback
@@ -12,22 +13,56 @@ use serde::{Deserialize, Serialize};
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 
-const RUNNER: &str = include_str!("../scripts/layout_runner.py");
+const RUNNER: &str = include_str!("../scripts/python_runner.py");
 const TIMEOUT: Duration = Duration::from_secs(60);
 const MAX_CODE_BYTES: usize = 256 * 1024;
 
+/// What the code computes: `layout(ctx)` (antenna positions), `positions(ctx)` (one calibrator
+/// state per integration) or `buffer(ctx)` (the calibrator's transmit buffer).
+#[derive(Deserialize, Serialize, Clone, Copy, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum Kind {
+    #[default]
+    Layout,
+    Calibrator,
+    Transmitter,
+}
+
+impl Kind {
+    fn function(self) -> &'static str {
+        match self {
+            Kind::Layout => "layout()",
+            Kind::Calibrator => "positions()",
+            Kind::Transmitter => "buffer()",
+        }
+    }
+}
+
 #[derive(Deserialize, Serialize)]
-pub struct LayoutRequest {
+pub struct CodeRequest {
+    #[serde(default)]
+    pub kind: Kind,
     pub code: String,
-    /// Current array settings exposed to `layout(ctx)`.
+    /// Settings exposed to the function as `ctx`.
     #[serde(default)]
     pub context: serde_json::Map<String, serde_json::Value>,
 }
 
 #[derive(Serialize, Deserialize)]
-pub struct LayoutResponse {
+pub struct CodeResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub positions: Option<Vec<[f64; 3]>>,
+    /// Calibrator velocity and acceleration per row, when the code returned them.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub velocity: Option<Vec<[f64; 3]>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub acceleration: Option<Vec<[f64; 3]>>,
+    /// Calibrator transmit power per row (null: use the power field), when the code returned one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub power: Option<Vec<Option<f64>>>,
+    /// Transmit buffer: base64 of interleaved little-endian f32 IQ samples (cf32_le).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub buffer: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
     #[serde(default)]
@@ -58,10 +93,11 @@ pub fn is_loopback_host(host: &str) -> bool {
     name.eq_ignore_ascii_case("localhost") || name.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback())
 }
 
-pub async fn run(python: &str, request: LayoutRequest) -> Result<LayoutResponse, String> {
+pub async fn run(python: &str, request: CodeRequest) -> Result<CodeResponse, String> {
     if request.code.len() > MAX_CODE_BYTES {
-        return Err("the layout code is too long".into());
+        return Err("the code is too long".into());
     }
+    let function = request.kind.function();
     let input = serde_json::to_vec(&request).map_err(|e| e.to_string())?;
 
     let started = Instant::now();
@@ -80,11 +116,11 @@ pub async fn run(python: &str, request: LayoutRequest) -> Result<LayoutResponse,
 
     let output = tokio::time::timeout(TIMEOUT, child.wait_with_output())
         .await
-        .map_err(|_| format!("layout() did not finish within {} s", TIMEOUT.as_secs()))?
+        .map_err(|_| format!("{function} did not finish within {} s", TIMEOUT.as_secs()))?
         .map_err(|e| e.to_string())?;
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let mut response: LayoutResponse = stdout
+    let mut response: CodeResponse = stdout
         .lines()
         .rev()
         .find_map(|line| serde_json::from_str(line).ok())
@@ -92,7 +128,7 @@ pub async fn run(python: &str, request: LayoutRequest) -> Result<LayoutResponse,
             let stderr = String::from_utf8_lossy(&output.stderr);
             let tail: Vec<&str> = stderr.lines().rev().take(8).collect();
             format!(
-                "the layout runner produced no result:\n{}",
+                "the Python runner produced no result:\n{}",
                 tail.into_iter().rev().collect::<Vec<_>>().join("\n")
             )
         })?;

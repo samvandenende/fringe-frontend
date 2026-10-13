@@ -1,6 +1,6 @@
 // Environment views: 3D scene, array layout and orthographic sky map.
 import { Surface, showTip, hideTip, cmapColor, niceTicks, fmt, si } from './plot.js';
-import { centroid, sourceIntensity, sourceGain } from './model.js';
+import { centroid, sourceIntensity, sourceGain, isCurved, localIndex } from './model.js';
 
 const DEG = 180 / Math.PI;
 
@@ -23,6 +23,43 @@ export function intensityNormalizer(values, mode = 'auto') {
   return (v) => (v > 0 ? Math.max(0, (Math.log10(v) - l0) / (l1 - l0 || 1)) : 0);
 }
 
+const normCache = new WeakMap();
+
+/**
+ * Normaliser for the sources `env` shows, weighted by gain when `apparent`. A rotating sky passes
+ * `env.scaleSources` (its sources over the whole timeline) so the scale stays put during playback;
+ * that one is cached per pool, frequency and mode.
+ */
+function envNormalizer(env, apparent, values) {
+  const pool = env.scaleSources;
+  if (!pool) return intensityNormalizer(values, env.scale);
+  let byKey = normCache.get(pool);
+  if (!byKey || byKey.size > 16) normCache.set(pool, (byKey = new Map()));
+  const key = `${env.freq}|${apparent}|${env.scale}`;
+  if (!byKey.has(key)) {
+    byKey.set(key, intensityNormalizer(pool.map((s) => sourceIntensity(s, env.freq) * (apparent ? sourceGain(s) : 1)), env.scale));
+  }
+  return byKey.get(key);
+}
+
+/** Theme colour of a calibrator (or its trajectory). */
+const calColor = (t, c) => t[c.color] || t.s3;
+
+/** "calibrator", or the calibrator's name when several are on. */
+const calLabel = (c) => (c.named ? c.name : 'calibrator');
+
+/** Calibrator marker: a filled diamond, hollow when the calibrator is switched off. */
+function diamond(ctx, x, y, color, surface, hollow = false) {
+  ctx.beginPath(); ctx.moveTo(x, y - 7); ctx.lineTo(x + 6, y); ctx.lineTo(x, y + 7); ctx.lineTo(x - 6, y); ctx.closePath();
+  if (hollow) {
+    ctx.fillStyle = surface; ctx.fill();
+    ctx.strokeStyle = color; ctx.lineWidth = 1.5; ctx.stroke();
+  } else {
+    ctx.fillStyle = color; ctx.strokeStyle = surface; ctx.lineWidth = 2;
+    ctx.stroke(); ctx.fill();
+  }
+}
+
 /** Dot radius range so dense skies stay legible: [min, max] in px for a disk of radius R. */
 function dotRadii(n, R) {
   const spacing = R * Math.sqrt(Math.PI / Math.max(1, n));
@@ -37,7 +74,10 @@ function sourceTip(s, freq) {
     `<div class="tip-row">elevation<b>${(Math.asin(Math.max(-1, Math.min(1, s.z))) * DEG).toFixed(1)}°</b></div>` +
     `<div class="tip-row">I(${si(freq, 3, 'Hz')})<b>${fmt(I, 4)}</b></div>` +
     `<div class="tip-row">apparent (×z²)<b>${fmt(I * sourceGain(s), 4)}</b></div>` +
-    `<div class="tip-row">spectral index<b>${fmt(s.alpha, 3)}</b></div>`;
+    (isCurved(s)
+      ? `<div class="tip-row">indices α₁ / α₂ / α₃<b>${fmt(s.alpha, 3)} / ${fmt(s.alpha2 || 0, 3)} / ${fmt(s.alpha3 || 0, 3)}</b></div>` +
+        `<div class="tip-row">index at ${si(freq, 3, 'Hz')}<b>${fmt(localIndex(s, freq), 3)}</b></div>`
+      : `<div class="tip-row">spectral index<b>${fmt(s.alpha, 3)}</b></div>`);
 }
 
 // ---------------------------------------------------------------------------------------
@@ -92,7 +132,7 @@ export class SceneView {
     this.arrayRadius = r || 1;
     this.scale = 0.3 / this.arrayRadius; // array occupies the inner 30% of the dome
     const app = sources.map((s) => sourceIntensity(s, freq) * sourceGain(s));
-    const norm = intensityNormalizer(app, this.env.scale);
+    const norm = envNormalizer(this.env, true, app);
     this.sourceStyle = app.map((v) => norm(v));
   }
 
@@ -113,7 +153,7 @@ export class SceneView {
     if (!this.env) return;
     const P = this.project(w, h);
     this.P = P;
-    const { positions, sources, calibrator, cmap } = this.env;
+    const { positions, sources, cmap } = this.env;
 
     // Ground disk
     ctx.beginPath();
@@ -177,25 +217,42 @@ export class SceneView {
     }
     ctx.globalAlpha = 1;
 
-    // Calibrator
-    if (calibrator && calibrator.enabled) {
-      const rel = { x: calibrator.position.x - c.x, y: calibrator.position.y - c.y, z: calibrator.position.z - c.z };
-      const dist = Math.hypot(rel.x, rel.y, rel.z) || 1;
-      let k = s;
-      const far = dist * s > 0.95;
-      if (far) k = 0.95 / dist;
-      const q = P(rel.x * k, rel.y * k, rel.z * k);
-      const g = P(rel.x * k, rel.y * k, 0);
+    // Calibrators and their trajectories. Positions are drawn to scale with the array, or (all of
+    // them) projected onto a sphere just inside the dome when any would fall outside it.
+    const calibrators = this.env.calibrators || [], trajectories = this.env.trajectories || [];
+    const relOf = (p) => ({ x: p.x - c.x, y: p.y - c.y, z: p.z - c.z });
+    const distOf = (r) => Math.hypot(r.x, r.y, r.z) || 1;
+    const far = [...trajectories.flatMap((tr) => tr.points), ...calibrators.map((k) => k.position)]
+      .some((p) => distOf(relOf(p)) * s > 0.95);
+    const place = (p) => { const r = relOf(p); const k = far ? 0.95 / distOf(r) : s; return [r.x * k, r.y * k, r.z * k]; };
+    for (const tr of trajectories) {
+      const pts = tr.points.map((p) => P(...place(p)));
+      ctx.strokeStyle = calColor(t, tr); ctx.lineWidth = 1.5;
+      for (const [from, to, dash, alpha] of [[0, tr.index, [], 0.95], [tr.index, pts.length - 1, [4, 4], 0.45]]) {
+        if (to <= from) continue;
+        ctx.globalAlpha = alpha; ctx.setLineDash(dash);
+        ctx.beginPath();
+        for (let i = from; i <= to; i++) i === from ? ctx.moveTo(pts[i][0], pts[i][1]) : ctx.lineTo(pts[i][0], pts[i][1]);
+        ctx.stroke();
+      }
+      ctx.globalAlpha = 1; ctx.setLineDash([]);
+    }
+    for (const cal of calibrators) {
+      const color = calColor(t, cal);
+      const dist = distOf(relOf(cal.position));
+      const [qx, qy, qz] = place(cal.position);
+      const q = P(qx, qy, qz);
+      const g = P(qx, qy, 0);
       const o = P(0, 0, 0);
-      ctx.strokeStyle = t.s3; ctx.lineWidth = 1.2; ctx.setLineDash([4, 3]);
+      ctx.strokeStyle = color; ctx.lineWidth = 1.2; ctx.setLineDash([4, 3]);
       ctx.beginPath(); ctx.moveTo(o[0], o[1]); ctx.lineTo(q[0], q[1]); ctx.stroke();
       ctx.beginPath(); ctx.moveTo(g[0], g[1]); ctx.lineTo(q[0], q[1]); ctx.stroke();
       ctx.setLineDash([]);
-      ctx.fillStyle = t.s3; ctx.strokeStyle = t.surface; ctx.lineWidth = 2;
-      ctx.beginPath(); ctx.moveTo(q[0], q[1] - 7); ctx.lineTo(q[0] + 6, q[1]); ctx.lineTo(q[0], q[1] + 7); ctx.lineTo(q[0] - 6, q[1]); ctx.closePath();
-      ctx.stroke(); ctx.fill();
-      ctx.fillStyle = t.fg; ctx.textAlign = 'left';
-      ctx.fillText(`calibrator · ${si(dist, 3, 'm')}${far ? ' (not to scale)' : ''}`, q[0] + 10, q[1]);
+      diamond(ctx, q[0], q[1], color, t.surface, cal.silent);
+      ctx.fillStyle = t.fg;
+      const right = q[0] > w * 0.62;
+      ctx.textAlign = right ? 'right' : 'left';
+      ctx.fillText(`${calLabel(cal)} · ${si(dist, 3, 'm')}${far ? ' (not to scale)' : ''}${cal.silent ? ' · off' : ''}`, q[0] + (right ? -10 : 10), q[1]);
     }
 
     // Scale note
@@ -232,7 +289,7 @@ export class ArrayView {
     });
   }
 
-  /** env: { positions, calibrator, values?: per-antenna power, selected?, cmap } */
+  /** env: { positions, calibrators, values?: per-antenna power, selected?, cmap } */
   set(env) {
     this.env = env;
     if (env.values) {
@@ -246,7 +303,8 @@ export class ArrayView {
 
   draw(ctx, w, h, t) {
     if (!this.env) return;
-    const { positions, calibrator, values, selected, cmap } = this.env;
+    const { positions, values, selected, cmap } = this.env;
+    const calibrators = this.env.calibrators || [];
     let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
     for (const p of positions) { minX = Math.min(minX, p.x); maxX = Math.max(maxX, p.x); minY = Math.min(minY, p.y); maxY = Math.max(maxY, p.y); }
     const span = Math.max(maxX - minX, maxY - minY, 1) * 1.12;
@@ -298,13 +356,12 @@ export class ArrayView {
       ctx.beginPath(); ctx.arc(X(p.x), Y(p.y), r + 4, 0, 2 * Math.PI); ctx.stroke();
     }
 
-    // Calibrator ground position, or an edge arrow when outside the view
-    if (calibrator && calibrator.enabled) {
-      const { x, y, z } = calibrator.position;
+    // Calibrator ground positions, or edge markers when outside the view
+    for (const cal of calibrators) {
+      const { x, y, z } = cal.position;
       let px = X(x), py = Y(y);
       const inside = px >= L && px <= L + S && py >= T && py <= T + S;
-      ctx.fillStyle = t.s3; ctx.strokeStyle = t.surface; ctx.lineWidth = 2;
-      let label = `calibrator h=${si(z, 3, 'm')}`;
+      let label = `${calLabel(cal)} h=${si(z, 3, 'm')}`;
       if (!inside) {
         const ox = L + S / 2, oy = T + S / 2;
         const dx = px - ox, dy = py - oy;
@@ -312,8 +369,7 @@ export class ArrayView {
         px = ox + dx * k; py = oy + dy * k;
         label += ` · ${si(Math.hypot(x - cx, y - cy), 3, 'm')} away`;
       }
-      ctx.beginPath(); ctx.moveTo(px, py - 7); ctx.lineTo(px + 6, py); ctx.lineTo(px, py + 7); ctx.lineTo(px - 6, py); ctx.closePath();
-      ctx.stroke(); ctx.fill();
+      diamond(ctx, px, py, calColor(t, cal), t.surface, cal.silent);
       ctx.fillStyle = t.fg; ctx.font = t.font; ctx.textBaseline = 'middle';
       ctx.textAlign = px > L + S / 2 ? 'right' : 'left';
       ctx.fillText(label, px + (px > L + S / 2 ? -10 : 10), py);
@@ -362,11 +418,11 @@ export class SkyView {
     c.addEventListener('mouseleave', () => hideTip());
   }
 
-  /** env: { sources, calibrator, positions, freq, apparent: bool, cmap } */
+  /** env: { sources, calibrators, trajectories, positions, freq, apparent: bool, cmap } */
   set(env) {
     this.env = env;
     const vals = env.sources.map((s) => sourceIntensity(s, env.freq) * (env.apparent ? sourceGain(s) : 1));
-    const norm = intensityNormalizer(vals, env.scale);
+    const norm = envNormalizer(env, env.apparent, vals);
     this.style = vals.map(norm);
     this.order = vals.map((_, i) => i).sort((a, b) => vals[a] - vals[b]);
     this.render();
@@ -375,7 +431,8 @@ export class SkyView {
 
   draw(ctx, w, h, t) {
     if (!this.env) return;
-    const { sources, calibrator, positions, cmap } = this.env;
+    const { sources, positions, cmap } = this.env;
+    const calibrators = this.env.calibrators || [], trajectories = this.env.trajectories || [];
     const R = Math.min(w, h - 22) / 2 - 18;
     const ox = w / 2, oy = (h - 22) / 2 + 6;
     this.geom = { R, ox, oy };
@@ -406,16 +463,37 @@ export class SkyView {
       ctx.beginPath(); ctx.arc(ox + s.x * R, oy - s.y * R, rMin + (rMax - rMin) * v, 0, 2 * Math.PI); ctx.fill();
     }
 
-    if (calibrator && calibrator.enabled && positions.length) {
-      const c = centroid(positions);
-      const d = [calibrator.position.x - c.x, calibrator.position.y - c.y, calibrator.position.z - c.z];
+    const c = positions.length ? centroid(positions) : null;
+    for (const tr of c ? trajectories : []) {
+      const idx = tr.index;
+      const pts = tr.points.map((p) => {
+        const d = [p.x - c.x, p.y - c.y, p.z - c.z];
+        const n = Math.hypot(...d) || 1;
+        return [ox + (d[0] / n) * R, oy - (d[1] / n) * R, d[2] > 0];
+      });
+      ctx.strokeStyle = calColor(t, tr); ctx.lineWidth = 1.5;
+      for (const [from, to, dash, alpha] of [[0, idx, [], 0.95], [idx, pts.length - 1, [4, 4], 0.45]]) {
+        ctx.globalAlpha = alpha; ctx.setLineDash(dash);
+        ctx.beginPath();
+        let pen = false;
+        for (let i = from; i <= to; i++) {
+          const [x, y, up] = pts[i];
+          if (!up) { pen = false; continue; }
+          pen ? ctx.lineTo(x, y) : ctx.moveTo(x, y);
+          pen = true;
+        }
+        ctx.stroke();
+      }
+      ctx.globalAlpha = 1; ctx.setLineDash([]);
+    }
+    for (const cal of c ? calibrators : []) {
+      const d = [cal.position.x - c.x, cal.position.y - c.y, cal.position.z - c.z];
       const n = Math.hypot(...d) || 1;
       const px = ox + (d[0] / n) * R, py = oy - (d[1] / n) * R;
-      ctx.fillStyle = t.s3; ctx.strokeStyle = t.surface; ctx.lineWidth = 2;
-      ctx.beginPath(); ctx.moveTo(px, py - 7); ctx.lineTo(px + 6, py); ctx.lineTo(px, py + 7); ctx.lineTo(px - 6, py); ctx.closePath();
-      ctx.stroke(); ctx.fill();
-      ctx.fillStyle = t.fg; ctx.textAlign = 'left';
-      ctx.fillText(d[2] / n > 0 ? 'calibrator' : 'calibrator (below horizon)', px + 9, py);
+      diamond(ctx, px, py, calColor(t, cal), t.surface, cal.silent);
+      ctx.fillStyle = t.fg; ctx.textAlign = 'left'; ctx.textBaseline = 'middle';
+      const name = calLabel(cal);
+      ctx.fillText(d[2] / n > 0 ? name : `${name} (below horizon${cal.silent ? ', off' : ''})`, px + 9, py);
     }
 
     ctx.fillStyle = t.muted; ctx.textAlign = 'left'; ctx.textBaseline = 'bottom';
