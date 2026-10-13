@@ -110,13 +110,6 @@ The receiver noise is received as a flux density of `k_B T_sys / A_eff` with
 sample frequency f_s is received like a sky source of `z² P / (4π d² f_s) / 10⁻²⁶` Jy. Saved HDF5
 files carry `units` attributes.
 
-### Theme
-
-The interface uses a field-notebook look: dark grey graph paper with blue ink and a red-pencil
-accent, or manila paper and navy ink with the light/dark toggle in the top bar. Fonts (IBM Plex,
-Space Grotesk) come from Google Fonts and fall back to system fonts offline. The categorical chart
-colours were checked for contrast and for separation under simulated colour-vision deficiencies.
-
 ### Timelines: sky rotation and calibrator positions
 
 Every run is a timeline of *Integrations* windows at UTC times: *Simulation → Start epoch* plus

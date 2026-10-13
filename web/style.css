@@ -94,8 +94,11 @@
 }
 
 * { box-sizing: border-box; }
-html, body { height: 100%; }
+html { height: 100%; }
+/* min-height, not height: a body fixed at one viewport would end there and take the sticky top
+   bar with it once the page scrolls further. */
 body {
+  min-height: 100%;
   margin: 0;
   background-color: var(--page);
   background-image: var(--page-texture);
@@ -352,6 +355,15 @@ input:disabled, select:disabled { opacity: .5; }
   .topbar { gap: 10px; }
   .card.tall .viz { height: 340px; }
   .params { height: auto; max-height: 440px; }
+}
+/* Phones: the top bar keeps the logo, run status, theme toggle and a short Run button. */
+@media (max-width: 600px) {
+  .topbar { gap: 8px; padding: 0 12px; }
+  .repo-links, .wide-only { display: none; }
+  .brand { flex: none; }
+  .run-state { flex: 1 1 0; }
+  #status-text { max-width: none; }
+  .top-actions { gap: 6px; }
 }
 
 /* ---------- Python layout dialog ---------- */

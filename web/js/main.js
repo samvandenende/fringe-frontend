@@ -710,7 +710,7 @@ const hasCalibrator = () => enabledCals().length > 0;
 
 function updateRunLabel() {
   const save = outputs && outputs.any();
-  $('run-btn').textContent = `▶ Run simulation${save ? ' & save' : ''}`;
+  $('run-btn').innerHTML = `<span>▶ Run<span class="wide-only"> simulation</span>${save ? ' &amp; save' : ''}</span>`;
 }
 
 /** Asks the user to pick one of `buttons` ({ label, value, primary }); resolves to its value, or '' if dismissed. */
